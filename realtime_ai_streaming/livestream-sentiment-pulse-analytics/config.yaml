@@ -1,0 +1,17 @@
+app_name: LiveStream Sentiment Pulse Analytics
+aws_region: us-east-1
+aws_services:
+- kinesis
+- api_gateway
+- ecs
+- dynamodb
+- bedrock
+- rekognition
+- transcribe
+- lambda
+- cloudwatch
+- eventbridge
+llm_config:
+  max_tokens: 2048
+  model: anthropic.claude-3-sonnet-20240229-v1:0
+  temperature: 0.7
