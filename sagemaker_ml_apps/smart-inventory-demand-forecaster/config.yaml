@@ -1,0 +1,15 @@
+app_name: Smart Inventory Demand Forecaster
+aws_region: us-east-1
+aws_services:
+- sagemaker
+- lambda
+- opensearch
+- api_gateway
+- ecs
+- s3
+- eventbridge
+- cloudwatch
+llm_config:
+  max_tokens: 2048
+  model: anthropic.claude-3-sonnet-20240229-v1:0
+  temperature: 0.7
