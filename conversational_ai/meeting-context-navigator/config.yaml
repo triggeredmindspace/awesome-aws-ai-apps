@@ -1,0 +1,15 @@
+app_name: Meeting Context Navigator
+aws_region: us-east-1
+aws_services:
+- lambda
+- step_functions
+- opensearch
+- bedrock
+- s3
+- dynamodb
+- eventbridge
+- api_gateway
+llm_config:
+  max_tokens: 2048
+  model: anthropic.claude-3-sonnet-20240229-v1:0
+  temperature: 0.7

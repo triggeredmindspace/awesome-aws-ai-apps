@@ -1,0 +1,456 @@
+```yaml
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Meeting Context Navigator - AI-powered meeting context and insights platform using Lambda, Step Functions, OpenSearch, Bedrock, S3, DynamoDB, EventBridge, and API Gateway'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: Environment name for resource tagging and naming
+
+  OpenSearchInstanceType:
+    Type: String
+    Default: t3.small.search
+    Description: OpenSearch instance type for the domain
+
+  OpenSearchVolumeSize:
+    Type: Number
+    Default: 10
+    MinValue: 10
+    MaxValue: 100
+    Description: EBS volume size in GB for OpenSearch domain
+
+  BedrockModelId:
+    Type: String
+    Default: anthropic.claude-v2
+    Description: Bedrock model ID for AI processing
+
+  RetentionDays:
+    Type: Number
+    Default: 90
+    Description: Number of days to retain meeting data
+
+Resources:
+  # S3 Bucket for Meeting Recordings and Transcripts
+  MeetingDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-meeting-data-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldRecordings
+            Status: Enabled
+            ExpirationInDays: !Ref RetentionDays
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: MeetingContextNavigator
+
+  # DynamoDB Table for Meeting Metadata
+  MeetingMetadataTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${AWS::StackName}-meeting-metadata'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: meetingId
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: N
+        - AttributeName: userId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: meetingId
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: UserMeetingsIndex
+          KeySchema:
+            - AttributeName: userId
+              KeyType: HASH
+            - AttributeName: timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: MeetingContextNavigator
+
+  # DynamoDB Table for Context Insights
+  ContextInsightsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${AWS::StackName}-context-insights'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: insightId
+          AttributeType: S
+        - AttributeName: meetingId
+          AttributeType: S
+        - AttributeName: createdAt
+          AttributeType: N
+      KeySchema:
+        - AttributeName: insightId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: MeetingInsightsIndex
+          KeySchema:
+            - AttributeName: meetingId
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: MeetingContextNavigator
+
+  # OpenSearch Domain for Meeting Search
+  MeetingSearchDomain:
+    Type: AWS::OpenSearchService::Domain
+    Properties:
+      DomainName: !Sub '${AWS::StackName}-meeting-search'
+      EngineVersion: 'OpenSearch_2.11'
+      ClusterConfig:
+        InstanceType: !Ref OpenSearchInstanceType
+        InstanceCount: 1
+        DedicatedMasterEnabled: false
+        ZoneAwarenessEnabled: false
+      EBSOptions:
+        EBSEnabled: true
+        VolumeSize: !Ref OpenSearchVolumeSize
+        VolumeType: gp3
+      EncryptionAtRestOptions:
+        Enabled: true
+      NodeToNodeEncryptionOptions:
+        Enabled: true
+      DomainEndpointOptions:
+        EnforceHTTPS: true
+      AccessPolicies:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !GetAtt OpenSearchAccessRole.Arn
+            Action: 'es:*'
+            Resource: !Sub 'arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/${AWS::StackName}-meeting-search/*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: MeetingContextNavigator
+
+  # IAM Role for OpenSearch Access
+  OpenSearchAccessRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-opensearch-access-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: OpenSearchAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'es:ESHttpGet'
+                  - 'es:ESHttpPost'
+                  - 'es:ESHttpPut'
+                  - 'es:ESHttpDelete'
+                Resource: !Sub 'arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/${AWS::StackName}-meeting-search/*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: MeetingContextNavigator
+
+  # IAM Role for Lambda Functions
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-lambda-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: MeetingNavigatorPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:PutObject'
+                  - 's3:DeleteObject'
+                Resource: !Sub '${MeetingDataBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - 'dynamodb:GetItem'
+                  - 'dynamodb:PutItem'
+                  - 'dynamodb:UpdateItem'
+                  - 'dynamodb:Query'
+                  - 'dynamodb:Scan'
+                Resource:
+                  - !GetAtt MeetingMetadataTable.Arn
+                  - !Sub '${MeetingMetadataTable.Arn}/index/*'
+                  - !GetAtt ContextInsightsTable.Arn
+                  - !Sub '${ContextInsightsTable.Arn}/index/*'
+              - Effect: Allow
+                Action:
+                  - 'bedrock:InvokeModel'
+                  - 'bedrock:InvokeModelWithResponseStream'
+                Resource: !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/${BedrockModelId}'
+              - Effect: Allow
+                Action:
+                  - 'es:ESHttpGet'
+                  - 'es:ESHttpPost'
+                  - 'es:ESHttpPut'
+                Resource: !GetAtt MeetingSearchDomain.Arn
+              - Effect: Allow
+                Action:
+                  - 'states:StartExecution'
+                Resource: !Ref ProcessingStateMachine
+              - Effect: Allow
+                Action:
+                  - 'transcribe:StartTranscriptionJob'
+                  - 'transcribe:GetTranscriptionJob'
+                Resource: '*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: MeetingContextNavigator
+
+  # Lambda Function: Upload Handler
+  UploadHandlerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-upload-handler'
+      Runtime: python3.11
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      MemorySize: 512
+      Environment:
+        Variables:
+          MEETING_METADATA_TABLE: !Ref MeetingMetadataTable
+          MEETING_DATA_BUCKET: !Ref MeetingDataBucket
+          STATE_MACHINE_ARN: !Ref ProcessingStateMachine
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime
+          
+          s3 = boto3.client('s3')
+          dynamodb = boto3.resource('dynamodb')
+          stepfunctions = boto3.client('stepfunctions')
+          
+          def handler(event, context):
+              table = dynamodb.Table(os.environ['MEETING_METADATA_TABLE'])
+              
+              # Generate presigned URL for upload
+              if event.get('httpMethod') == 'POST':
+                  body = json.loads(event['body'])
+                  meeting_id = body['meetingId']
+                  file_name = body['fileName']
+                  
+                  key = f"recordings/{meeting_id}/{file_name}"
+                  
+                  presigned_url = s3.generate_presigned_url(
+                      'put_object',
+                      Params={
+                          'Bucket': os.environ['MEETING_DATA_BUCKET'],
+                          'Key': key
+                      },
+                      ExpiresIn=3600
+                  )
+                  
+                  # Store metadata
+                  table.put_item(
+                      Item={
+                          'meetingId': meeting_id,
+                          'timestamp': int(datetime.now().timestamp()),
+                          'userId': body.get('userId', 'unknown'),
+                          'fileName': file_name,
+                          'status': 'uploaded',
+                          's3Key': key
+                      }
+                  )
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'uploadUrl': presigned_url,
+                          'meetingId': meeting_id
+                      })
+                  }
+              
+              return {
+                  'statusCode': 400,
+                  'body': json.dumps({'error': 'Invalid request'})
+              }
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: MeetingContextNavigator
+
+  # Lambda Function: Transcription Processor
+  TranscriptionProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-transcription-processor'
+      Runtime: python3.11
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      MemorySize: 1024
+      Environment:
+        Variables:
+          MEETING_DATA_BUCKET: !Ref MeetingDataBucket
+          MEETING_METADATA_TABLE: !Ref MeetingMetadataTable
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          
+          transcribe = boto3.client('transcribe')
+          s3 = boto3.client('s3')
+          
+          def handler(event, context):
+              meeting_id = event['meetingId']
+              s3_key = event['s3Key']
+              
+              job_name = f"transcribe-{meeting_id}"
+              
+              transcribe.start_transcription_job(
+                  TranscriptionJobName=job_name,
+                  Media={
+                      'MediaFileUri': f"s3://{os.environ['MEETING_DATA_BUCKET']}/{s3_key}"
+                  },
+                  MediaFormat='mp4',
+                  LanguageCode='en-US',
+                  OutputBucketName=os.environ['MEETING_DATA_BUCKET'],
+                  OutputKey=f"transcripts/{meeting_id}/transcript.json"
+              )
+              
+              return {
+                  'meetingId': meeting_id,
+                  'transcriptionJobName': job_name,
+                  'status': 'processing'
+              }
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: MeetingContextNavigator
+
+  # Lambda Function: Context Analyzer
+  ContextAnalyzerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-context-analyzer'
+      Runtime: python3.11
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      MemorySize: 2048
+      Environment:
+        Variables:
+          BEDROCK_MODEL_ID: !Ref BedrockModelId
+          CONTEXT_INSIGHTS_TABLE: !Ref ContextInsightsTable
+          OPENSEARCH_ENDPOINT: !GetAtt MeetingSearchDomain.DomainEndpoint
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime
+          import uuid
+          
+          bedrock = boto3.client('bedrock-runtime')
+          dynamodb = boto3.resource('dynamodb')
+          
+          def handler(event, context):
+              meeting_id = event['meetingId']
+              transcript = event['transcript']
+              
+              # Invoke Bedrock for context analysis
+              prompt = f"""Analyze the following meeting transcript and provide:
+              1. Key topics discussed
+              2. Action items
+              3. Decisions made
+              4. Important insights
+              
+              Transcript:
+              {transcript}
+              
+              Provide response in JSON format."""
+              
+              response = bedrock.invoke_model(
+                  modelId=os.environ['BEDROCK_MODEL_ID'],
+                  body=json.dumps({
+                      'prompt': prompt,
+                      'max_tokens_to_sample': 2000
+                  })
+              )
+              
+              result = json.loads(response['body'].read())
+              
+              # Store insights
+              table = dynamodb.Table(os.environ['CONTEXT_INSIGHTS_TABLE'])
+              insight_id = str(uuid.uuid4())
+              
+              table.put_item(
+                  Item={
+                      'insightId': insight_id,
+                      'meetingId': meeting_id,

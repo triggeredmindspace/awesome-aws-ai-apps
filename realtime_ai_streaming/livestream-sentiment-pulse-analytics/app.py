@@ -4,17 +4,20 @@ import base64
 import json
 import logging
 import os
+import re
 import time
 from datetime import datetime, timedelta
 from enum import Enum
 from typing import Any, Dict, List, Optional, Set
 from uuid import uuid4
+from concurrent.futures import ThreadPoolExecutor
 
 import boto3
-from botocore.exceptions import ClientError
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, BackgroundTasks
+from botocore.exceptions import ClientError, NoCredentialsError, PartialCredentialsError
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, BackgroundTasks, Security, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field, validator
 import uvicorn
 
@@ -43,7 +46,133 @@ class Config:
     SENTIMENT_THRESHOLD_NEGATIVE = float(os.getenv("SENTIMENT_THRESHOLD_NEGATIVE", "-0.5"))
     SENTIMENT_THRESHOLD_POSITIVE = float(os.getenv("SENTIMENT_THRESHOLD_POSITIVE", "0.5"))
     VIRAL_MOMENT_THRESHOLD = int(os.getenv("VIRAL_MOMENT_THRESHOLD", "100"))
-    API_KEY = os.getenv("API_KEY", "")
+    S3_ENCRYPTION_TYPE = os.getenv("S3_ENCRYPTION_TYPE", "AES256")  # AES256 or aws:kms
+    S3_KMS_KEY_ID = os.getenv("S3_KMS_KEY_ID", "")  # Optional KMS key ID for aws:kms encryption
+    MAX_INPUT_LENGTH = int(os.getenv("MAX_INPUT_LENGTH", "10000"))  # Maximum input text length
+    
+    # API_KEY must be set - no default value
+    API_KEY = os.environ.get("API_KEY")
+    if not API_KEY:
+        raise ValueError("API_KEY environment variable must be set")
+
+
+# ==================== Input Sanitization ====================
+class InputSanitizer:
+    """Sanitizes user input to prevent prompt injection and other attacks."""
+    
+    @staticmethod
+    def sanitize_text(text: str, max_length: int = Config.MAX_INPUT_LENGTH) -> str:
+        """
+        Sanitize text input to prevent prompt injection.
+        
+        Args:
+            text: Raw text input
+            max_length: Maximum allowed length
+            
+        Returns:
+            Sanitized text
+            
+        Raises:
+            ValueError: If input is invalid
+        """
+        if not isinstance(text, str):
+            raise ValueError("Input must be a string")
+        
+        # Limit length
+        if len(text) > max_length:
+            logger.warning(f"Input text truncated from {len(text)} to {max_length} characters")
+            text = text[:max_length]
+        
+        # Remove control characters except common whitespace
+        text = ''.join(char for char in text if char.isprintable() or char in '\n\r\t ')
+        
+        # Escape special characters that could be used for injection
+        # Remove or escape common prompt injection patterns
+        injection_patterns = [
+            r'<\|.*?\|>',  # Special tokens
+            r'\[INST\].*?\[/INST\]',  # Instruction markers
+            r'###\s*System:',  # System prompts
+            r'###\s*Assistant:',  # Assistant markers
+            r'Human:.*?Assistant:',  # Conversation markers
+        ]
+        
+        for pattern in injection_patterns:
+            text = re.sub(pattern, '', text, flags=re.IGNORECASE | re.DOTALL)
+        
+        # Remove excessive whitespace
+        text = ' '.join(text.split())
+        
+        # Final validation
+        if not text or len(text.strip()) == 0:
+            raise ValueError("Input text is empty after sanitization")
+        
+        return text.strip()
+    
+    @staticmethod
+    def validate_and_sanitize(text: str) -> str:
+        """
+        Validate and sanitize text input with comprehensive checks.
+        
+        Args:
+            text: Raw text input
+            
+        Returns:
+            Sanitized and validated text
+            
+        Raises:
+            ValueError: If input fails validation
+        """
+        if text is None:
+            raise ValueError("Input text cannot be None")
+        
+        # Sanitize
+        sanitized = InputSanitizer.sanitize_text(text)
+        
+        # Additional validation
+        if len(sanitized) < 1:
+            raise ValueError("Input text too short after sanitization")
+        
+        # Check for suspicious patterns
+        suspicious_patterns = [
+            r'ignore\s+previous\s+instructions',
+            r'disregard\s+all\s+prior',
+            r'forget\s+everything',
+            r'new\s+instructions:',
+            r'system\s+override',
+        ]
+        
+        for pattern in suspicious_patterns:
+            if re.search(pattern, sanitized, re.IGNORECASE):
+                logger.warning(f"Suspicious pattern detected in input: {pattern}")
+                # Remove the suspicious content
+                sanitized = re.sub(pattern, '', sanitized, flags=re.IGNORECASE)
+        
+        return sanitized
+
+
+# ==================== API Key Authentication ====================
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=True)
+
+async def validate_api_key(api_key: str = Security(api_key_header)):
+    """
+    Validate API key from request header.
+    
+    Args:
+        api_key: API key from X-API-Key header
+        
+    Returns:
+        The validated API key
+        
+    Raises:
+        HTTPException: If API key is invalid
+    """
+    if api_key != Config.API_KEY:
+        logger.warning(f"Invalid API key attempt: {api_key[:8]}...")
+        raise HTTPException(
+            status_code=403,
+            detail="Invalid API key"
+        )
+    return api_key
 
 
 # ==================== Data Models ====================
@@ -144,262 +273,112 @@ class AWSServiceManager:
     def __init__(self):
         """Initialize AWS service clients."""
         self.region = Config.AWS_REGION
+        self.executor = ThreadPoolExecutor(max_workers=10)
         
+        # Initialize clients with error handling
         try:
             self.kinesis_video = boto3.client('kinesisvideo', region_name=self.region)
-            self.kinesis_data = boto3.client('kinesis', region_name=self.region)
-            self.dynamodb = boto3.resource('dynamodb', region_name=self.region)
-            self.rekognition = boto3.client('rekognition', region_name=self.region)
-            self.transcribe = boto3.client('transcribe', region_name=self.region)
-            self.bedrock_runtime = boto3.client('bedrock-runtime', region_name=self.region)
-            self.s3 = boto3.client('s3', region_name=self.region)
-            self.cloudwatch = boto3.client('cloudwatch', region_name=self.region)
-            self.eventbridge = boto3.client('events', region_name=self.region)
-            self.sns = boto3.client('sns', region_name=self.region)
-            self.lambda_client = boto3.client('lambda', region_name=self.region)
-            
-            # DynamoDB tables
-            self.sentiment_table = self.dynamodb.Table(Config.DYNAMODB_TABLE)
-            self.events_table = self.dynamodb.Table(Config.DYNAMODB_EVENTS_TABLE)
-            self.highlights_table = self.dynamodb.Table(Config.DYNAMODB_HIGHLIGHTS_TABLE)
-            
-            logger.info("AWS service clients initialized successfully")
-        except Exception as e:
-            logger.error(f"Failed to initialize AWS clients: {str(e)}")
+            logger.info("Kinesis Video client initialized successfully")
+        except (NoCredentialsError, PartialCredentialsError) as e:
+            logger.error(f"Failed to initialize Kinesis Video client - missing or invalid AWS credentials: {str(e)}")
             raise
-    
-    def put_cloudwatch_metric(self, metric_name: str, value: float, unit: str = "Count"):
-        """Put custom metric to CloudWatch."""
-        try:
-            self.cloudwatch.put_metric_data(
-                Namespace=Config.CLOUDWATCH_NAMESPACE,
-                MetricData=[
-                    {
-                        'MetricName': metric_name,
-                        'Value': value,
-                        'Unit': unit,
-                        'Timestamp': datetime.utcnow()
-                    }
-                ]
-            )
         except ClientError as e:
-            logger.error(f"Failed to put CloudWatch metric: {str(e)}")
-
-
-# ==================== Sentiment Analysis Engine ====================
-class SentimentAnalysisEngine:
-    """Core sentiment analysis engine using AWS AI services."""
-    
-    def __init__(self, aws_manager: AWSServiceManager):
-        """Initialize sentiment analysis engine."""
-        self.aws = aws_manager
-        self.sentiment_cache: Dict[str, List[SentimentData]] = {}
-        
-    async def analyze_video_frame(self, frame_data: bytes, event_id: str) -> Optional[SentimentData]:
-        """
-        Analyze video frame for facial emotions using Rekognition.
-        
-        Args:
-            frame_data: Raw video frame bytes
-            event_id: Event identifier
-            
-        Returns:
-            SentimentData object or None if analysis fails
-        """
-        try:
-            # Detect faces and emotions in the frame
-            response = self.aws.rekognition.detect_faces(
-                Image={'Bytes': frame_data},
-                Attributes=['ALL']
-            )
-            
-            if not response.get('FaceDetails'):
-                return None
-            
-            # Aggregate emotions from all detected faces
-            emotion_scores = {}
-            total_confidence = 0.0
-            
-            for face in response['FaceDetails']:
-                for emotion in face.get('Emotions', []):
-                    emotion_type = emotion['Type'].upper()
-                    confidence = emotion['Confidence'] / 100.0
-                    
-                    if emotion_type in EmotionType.__members__:
-                        emotion_scores[emotion_type] = emotion_scores.get(emotion_type, 0) + confidence
-                        total_confidence += confidence
-            
-            # Normalize emotion scores
-            if total_confidence > 0:
-                emotion_scores = {k: v / total_confidence for k, v in emotion_scores.items()}
-            
-            # Calculate overall sentiment score
-            sentiment_score = self._calculate_sentiment_from_emotions(emotion_scores)
-            sentiment_type = self._classify_sentiment(sentiment_score)
-            
-            sentiment_data = SentimentData(
-                event_id=event_id,
-                sentiment=sentiment_type,
-                sentiment_score=sentiment_score,
-                confidence=total_confidence / len(response['FaceDetails']) if response['FaceDetails'] else 0.0,
-                emotions={EmotionType[k]: v for k, v in emotion_scores.items()},
-                source_type="video",
-                metadata={'face_count': len(response['FaceDetails'])}
-            )
-            
-            # Store in cache
-            self._cache_sentiment(event_id, sentiment_data)
-            
-            # Send to CloudWatch
-            self.aws.put_cloudwatch_metric('VideoSentimentScore', sentiment_score)
-            
-            return sentiment_data
-            
-        except ClientError as e:
-            logger.error(f"Rekognition analysis failed: {str(e)}")
-            return None
-    
-    async def analyze_audio_sentiment(self, audio_data: bytes, event_id: str) -> Optional[SentimentData]:
-        """
-        Analyze audio for voice tone and transcribe text for sentiment.
-        
-        Args:
-            audio_data: Raw audio bytes
-            event_id: Event identifier
-            
-        Returns:
-            SentimentData object or None if analysis fails
-        """
-        try:
-            # Upload audio to S3 for Transcribe processing
-            audio_key = f"audio/{event_id}/{uuid4()}.wav"
-            self.aws.s3.put_object(
-                Bucket=Config.S3_BUCKET,
-                Key=audio_key,
-                Body=audio_data
-            )
-            
-            # Start transcription job
-            job_name = f"transcribe-{event_id}-{int(time.time())}"
-            self.aws.transcribe.start_transcription_job(
-                TranscriptionJobName=job_name,
-                Media={'MediaFileUri': f"s3://{Config.S3_BUCKET}/{audio_key}"},
-                MediaFormat='wav',
-                LanguageCode='en-US',
-                Settings={
-                    'ShowSpeakerLabels': True,
-                    'MaxSpeakerLabels': 10
-                }
-            )
-            
-            # Wait for transcription (in production, use async polling)
-            max_wait = 30
-            waited = 0
-            while waited < max_wait:
-                status = self.aws.transcribe.get_transcription_job(
-                    TranscriptionJobName=job_name
-                )
-                if status['TranscriptionJob']['TranscriptionJobStatus'] == 'COMPLETED':
-                    break
-                await asyncio.sleep(1)
-                waited += 1
-            
-            if waited >= max_wait:
-                logger.warning(f"Transcription timeout for job {job_name}")
-                return None
-            
-            # Get transcript
-            transcript_uri = status['TranscriptionJob']['Transcript']['TranscriptFileUri']
-            # In production, fetch and parse the transcript
-            transcript_text = "Sample transcript"  # Placeholder
-            
-            # Analyze sentiment using Bedrock
-            sentiment_data = await self.analyze_text_sentiment(transcript_text, event_id)
-            if sentiment_data:
-                sentiment_data.source_type = "audio"
-            
-            return sentiment_data
-            
-        except ClientError as e:
-            logger.error(f"Audio analysis failed: {str(e)}")
-            return None
-    
-    async def analyze_text_sentiment(self, text: str, event_id: str) -> Optional[SentimentData]:
-        """
-        Analyze text sentiment using Bedrock Claude.
-        
-        Args:
-            text: Text content to analyze
-            event_id: Event identifier
-            
-        Returns:
-            SentimentData object or None if analysis fails
-        """
-        try:
-            # Prepare prompt for Claude
-            prompt = f"""Analyze the sentiment and emotions in the following text. 
-            Provide a JSON response with:
-            - sentiment: POSITIVE, NEGATIVE, NEUTRAL, or MIXED
-            - sentiment_score: float between -1.0 (very negative) and 1.0 (very positive)
-            - confidence: float between 0.0 and 1.0
-            - emotions: object with emotion types and their intensity (0.0 to 1.0)
-            
-            Text: {text}
-            
-            Respond only with valid JSON."""
-            
-            # Call Bedrock
-            request_body = {
-                "anthropic_version": "bedrock-2023-05-31",
-                "max_tokens": 1000,
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": prompt
-                    }
-                ]
-            }
-            
-            response = self.aws.bedrock_runtime.invoke_model(
-                modelId=Config.BEDROCK_MODEL_ID,
-                body=json.dumps(request_body)
-            )
-            
-            response_body = json.loads(response['body'].read())
-            content = response_body['content'][0]['text']
-            
-            # Parse JSON response
-            analysis = json.loads(content)
-            
-            # Map emotions to EmotionType enum
-            emotions = {}
-            for emotion_name, score in analysis.get('emotions', {}).items():
-                emotion_upper = emotion_name.upper()
-                if emotion_upper in EmotionType.__members__:
-                    emotions[EmotionType[emotion_upper]] = float(score)
-            
-            sentiment_data = SentimentData(
-                event_id=event_id,
-                sentiment=SentimentType[analysis['sentiment']],
-                sentiment_score=float(analysis['sentiment_score']),
-                confidence=float(analysis['confidence']),
-                emotions=emotions,
-                text_content=text,
-                source_type="text"
-            )
-            
-            # Store in cache
-            self._cache_sentiment(event_id, sentiment_data)
-            
-            # Send to CloudWatch
-            self.aws.put_cloudwatch_metric('TextSentimentScore', sentiment_data.sentiment_score)
-            
-            return sentiment_data
-            
+            logger.error(f"Failed to initialize Kinesis Video client - insufficient permissions or service error: {str(e)}")
+            raise
         except Exception as e:
-            logger.error(f"Text sentiment analysis failed: {str(e)}")
-            return None
-    
-    async def analyze_multimodal(
-        self,
-        video_frame:
+            logger.error(f"Failed to initialize Kinesis Video client - unexpected error: {str(e)}")
+            raise
+        
+        try:
+            self.kinesis_data = boto3.client('kinesis', region_name=self.region)
+            logger.info("Kinesis Data client initialized successfully")
+        except (NoCredentialsError, PartialCredentialsError) as e:
+            logger.error(f"Failed to initialize Kinesis Data client - missing or invalid AWS credentials: {str(e)}")
+            raise
+        except ClientError as e:
+            logger.error(f"Failed to initialize Kinesis Data client - insufficient permissions or service error: {str(e)}")
+            raise
+        except Exception as e:
+            logger.error(f"Failed to initialize Kinesis Data client - unexpected error: {str(e)}")
+            raise
+        
+        try:
+            self.dynamodb = boto3.resource('dynamodb', region_name=self.region)
+            logger.info("DynamoDB resource initialized successfully")
+        except (NoCredentialsError, PartialCredentialsError) as e:
+            logger.error(f"Failed to initialize DynamoDB resource - missing or invalid AWS credentials: {str(e)}")
+            raise
+        except ClientError as e:
+            logger.error(f"Failed to initialize DynamoDB resource - insufficient permissions or service error: {str(e)}")
+            raise
+        except Exception as e:
+            logger.error(f"Failed to initialize DynamoDB resource - unexpected error: {str(e)}")
+            raise
+        
+        try:
+            self.rekognition = boto3.client('rekognition', region_name=self.region)
+            logger.info("Rekognition client initialized successfully")
+        except (NoCredentialsError, PartialCredentialsError) as e:
+            logger.error(f"Failed to initialize Rekognition client - missing or invalid AWS credentials: {str(e)}")
+            raise
+        except ClientError as e:
+            logger.error(f"Failed to initialize Rekognition client - insufficient permissions or service error: {str(e)}")
+            raise
+        except Exception as e:
+            logger.error(f"Failed to initialize Rekognition client - unexpected error: {str(e)}")
+            raise
+        
+        try:
+            self.transcribe = boto3.client('transcribe', region_name=self.region)
+            logger.info("Transcribe client initialized successfully")
+        except (NoCredentialsError, PartialCredentialsError) as e:
+            logger.error(f"Failed to initialize Transcribe client - missing or invalid AWS credentials: {str(e)}")
+            raise
+        except ClientError as e:
+            logger.error(f"Failed to initialize Transcribe client - insufficient permissions or service error: {str(e)}")
+            raise
+        except Exception as e:
+            logger.error(f"Failed to initialize Transcribe client - unexpected error: {str(e)}")
+            raise
+        
+        try:
+            self.bedrock_runtime = boto3.client('bedrock-runtime', region_name=self.region)
+            logger.info("Bedrock Runtime client initialized successfully")
+        except (NoCredentialsError, PartialCredentialsError) as e:
+            logger.error(f"Failed to initialize Bedrock Runtime client - missing or invalid AWS credentials: {str(e)}")
+            raise
+        except ClientError as e:
+            logger.error(f"Failed to initialize Bedrock Runtime client - insufficient permissions or service error: {str(e)}")
+            raise
+        except Exception as e:
+            logger.error(f"Failed to initialize Bedrock Runtime client - unexpected error: {str(e)}")
+            raise
+        
+        try:
+            self.s3 = boto3.client('s3', region_name=self.region)
+            logger.info("S3 client initialized successfully")
+        except (NoCredentialsError, PartialCredentialsError) as e:
+            logger.error(f"Failed to initialize S3 client - missing or invalid AWS credentials: {str(e)}")
+            raise
+        except ClientError as e:
+            logger.error(f"Failed to initialize S3 client - insufficient permissions or service error: {str(e)}")
+            raise
+        except Exception as e:
+            logger.error(f"Failed to initialize S3 client - unexpected error: {str(e)}")
+            raise
+        
+        try:
+            self.cloudwatch = boto3.client('cloudwatch', region_name=self.region)
+            logger.info("CloudWatch client initialized successfully")
+        except (NoCredentialsError, PartialCredentialsError) as e:
+            logger.error(f"Failed to initialize CloudWatch client - missing or invalid AWS credentials: {str(e)}")
+            raise
+        except ClientError as e:
+            logger.error(f"Failed to initialize CloudWatch client - insufficient permissions or service error: {str(e)}")
+            raise
+        except Exception as e:
+            logger.error(f"Failed to initialize CloudWatch client - unexpected error: {str(e)}")
+            raise
+        
+        try:
+            self.
