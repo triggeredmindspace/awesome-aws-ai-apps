@@ -6,11 +6,14 @@ import logging
 import os
 import re
 import time
+import unicodedata
 from datetime import datetime, timedelta
 from enum import Enum
 from typing import Any, Dict, List, Optional, Set
 from uuid import uuid4
 from concurrent.futures import ThreadPoolExecutor
+from collections import defaultdict
+from contextlib import asynccontextmanager
 
 import boto3
 from botocore.exceptions import ClientError, NoCredentialsError, PartialCredentialsError
@@ -49,6 +52,8 @@ class Config:
     S3_ENCRYPTION_TYPE = os.getenv("S3_ENCRYPTION_TYPE", "AES256")  # AES256 or aws:kms
     S3_KMS_KEY_ID = os.getenv("S3_KMS_KEY_ID", "")  # Optional KMS key ID for aws:kms encryption
     MAX_INPUT_LENGTH = int(os.getenv("MAX_INPUT_LENGTH", "10000"))  # Maximum input text length
+    RATE_LIMIT_REQUESTS = int(os.getenv("RATE_LIMIT_REQUESTS", "100"))  # Requests per window
+    RATE_LIMIT_WINDOW = int(os.getenv("RATE_LIMIT_WINDOW", "60"))  # Window in seconds
     
     # API_KEY must be set - no default value
     API_KEY = os.environ.get("API_KEY")
@@ -56,9 +61,207 @@ class Config:
         raise ValueError("API_KEY environment variable must be set")
 
 
+# ==================== Rate Limiter ====================
+class RateLimiter:
+    """Rate limiting and anomaly detection for API requests."""
+    
+    def __init__(self):
+        self.request_counts = defaultdict(list)
+        self.blocked_ips = {}
+        
+    def check_rate_limit(self, client_id: str) -> bool:
+        """
+        Check if client has exceeded rate limit.
+        
+        Args:
+            client_id: Client identifier (IP address or API key)
+            
+        Returns:
+            True if request is allowed, False if rate limited
+        """
+        now = time.time()
+        window_start = now - Config.RATE_LIMIT_WINDOW
+        
+        # Check if client is blocked
+        if client_id in self.blocked_ips:
+            block_until = self.blocked_ips[client_id]
+            if now < block_until:
+                logger.warning(f"Blocked client {client_id} attempted request")
+                return False
+            else:
+                del self.blocked_ips[client_id]
+        
+        # Clean old requests
+        self.request_counts[client_id] = [
+            req_time for req_time in self.request_counts[client_id]
+            if req_time > window_start
+        ]
+        
+        # Check rate limit
+        if len(self.request_counts[client_id]) >= Config.RATE_LIMIT_REQUESTS:
+            logger.warning(f"Rate limit exceeded for client {client_id}")
+            # Block for 5 minutes
+            self.blocked_ips[client_id] = now + 300
+            return False
+        
+        # Add current request
+        self.request_counts[client_id].append(now)
+        return True
+    
+    def detect_anomaly(self, client_id: str, text: str) -> bool:
+        """
+        Detect anomalous behavior patterns.
+        
+        Args:
+            client_id: Client identifier
+            text: Input text to analyze
+            
+        Returns:
+            True if anomaly detected, False otherwise
+        """
+        # Check for repeated identical requests (potential attack)
+        recent_requests = self.request_counts[client_id][-10:]
+        if len(recent_requests) >= 5:
+            # If more than 5 requests in last 10, check for suspicious patterns
+            if len(text) > Config.MAX_INPUT_LENGTH * 0.9:
+                logger.warning(f"Anomaly detected: Large input from {client_id}")
+                return True
+        
+        return False
+
+
 # ==================== Input Sanitization ====================
 class InputSanitizer:
     """Sanitizes user input to prevent prompt injection and other attacks."""
+    
+    @staticmethod
+    def normalize_unicode(text: str) -> str:
+        """
+        Normalize Unicode characters to prevent Unicode-based bypasses.
+        
+        Args:
+            text: Input text
+            
+        Returns:
+            Normalized text
+        """
+        # Normalize to NFKC form (compatibility decomposition + canonical composition)
+        text = unicodedata.normalize('NFKC', text)
+        
+        # Remove zero-width characters and other invisible Unicode
+        invisible_chars = [
+            '\u200b',  # Zero-width space
+            '\u200c',  # Zero-width non-joiner
+            '\u200d',  # Zero-width joiner
+            '\ufeff',  # Zero-width no-break space
+            '\u2060',  # Word joiner
+            '\u180e',  # Mongolian vowel separator
+        ]
+        for char in invisible_chars:
+            text = text.replace(char, '')
+        
+        return text
+    
+    @staticmethod
+    def decode_common_encodings(text: str) -> str:
+        """
+        Detect and decode common encoding attempts.
+        
+        Args:
+            text: Input text
+            
+        Returns:
+            Decoded text
+        """
+        # Try to detect base64 encoding
+        try:
+            # Check if text looks like base64
+            if re.match(r'^[A-Za-z0-9+/]+=*$', text.replace('\n', '').replace('\r', '')):
+                decoded = base64.b64decode(text).decode('utf-8', errors='ignore')
+                if decoded and len(decoded) > 0:
+                    logger.warning("Base64 encoded input detected and decoded")
+                    text = decoded
+        except Exception:
+            pass
+        
+        # Decode URL encoding
+        try:
+            import urllib.parse
+            decoded = urllib.parse.unquote(text)
+            if decoded != text:
+                logger.warning("URL encoded input detected and decoded")
+                text = decoded
+        except Exception:
+            pass
+        
+        # Decode HTML entities
+        try:
+            import html
+            decoded = html.unescape(text)
+            if decoded != text:
+                logger.warning("HTML encoded input detected and decoded")
+                text = decoded
+        except Exception:
+            pass
+        
+        return text
+    
+    @staticmethod
+    def detect_prompt_injection(text: str) -> bool:
+        """
+        Detect prompt injection attempts using multiple techniques.
+        
+        Args:
+            text: Input text to check
+            
+        Returns:
+            True if injection detected, False otherwise
+        """
+        # Normalize text for detection (lowercase, remove extra spaces)
+        normalized = ' '.join(text.lower().split())
+        
+        # Comprehensive injection patterns
+        injection_patterns = [
+            # Instruction override attempts
+            r'ignore\s+(?:previous|prior|all|above)\s+(?:instructions?|prompts?|commands?)',
+            r'disregard\s+(?:previous|prior|all|above)',
+            r'forget\s+(?:previous|prior|all|above|everything)',
+            r'new\s+(?:instructions?|prompts?|commands?)\s*:',
+            r'system\s+(?:override|prompt|instruction)',
+            
+            # Role manipulation
+            r'you\s+are\s+(?:now|a)\s+(?:developer|admin|root|system)',
+            r'act\s+as\s+(?:a\s+)?(?:developer|admin|root|system)',
+            r'pretend\s+(?:to\s+be|you\s+are)',
+            
+            # Delimiter injection
+            r'<\|.*?\|>',
+            r'\[(?:INST|SYS|SYSTEM)\]',
+            r'###\s*(?:system|assistant|human|user)\s*:',
+            r'human\s*:\s*.*?\s*assistant\s*:',
+            
+            # Jailbreak attempts
+            r'jailbreak',
+            r'dan\s+mode',
+            r'developer\s+mode',
+            
+            # Prompt leaking
+            r'(?:show|reveal|display|print)\s+(?:your|the)\s+(?:prompt|instructions?|system\s+message)',
+            r'what\s+(?:are|is)\s+your\s+(?:instructions?|prompts?|rules)',
+        ]
+        
+        for pattern in injection_patterns:
+            if re.search(pattern, normalized):
+                logger.warning(f"Prompt injection pattern detected: {pattern}")
+                return True
+        
+        # Check for excessive special characters (potential obfuscation)
+        special_char_ratio = sum(1 for c in text if not c.isalnum() and not c.isspace()) / max(len(text), 1)
+        if special_char_ratio > 0.3:
+            logger.warning(f"High special character ratio detected: {special_char_ratio}")
+            return True
+        
+        return False
     
     @staticmethod
     def sanitize_text(text: str, max_length: int = Config.MAX_INPUT_LENGTH) -> str:
@@ -78,6 +281,12 @@ class InputSanitizer:
         if not isinstance(text, str):
             raise ValueError("Input must be a string")
         
+        # Normalize Unicode
+        text = InputSanitizer.normalize_unicode(text)
+        
+        # Decode common encodings
+        text = InputSanitizer.decode_common_encodings(text)
+        
         # Limit length
         if len(text) > max_length:
             logger.warning(f"Input text truncated from {len(text)} to {max_length} characters")
@@ -86,18 +295,9 @@ class InputSanitizer:
         # Remove control characters except common whitespace
         text = ''.join(char for char in text if char.isprintable() or char in '\n\r\t ')
         
-        # Escape special characters that could be used for injection
-        # Remove or escape common prompt injection patterns
-        injection_patterns = [
-            r'<\|.*?\|>',  # Special tokens
-            r'\[INST\].*?\[/INST\]',  # Instruction markers
-            r'###\s*System:',  # System prompts
-            r'###\s*Assistant:',  # Assistant markers
-            r'Human:.*?Assistant:',  # Conversation markers
-        ]
-        
-        for pattern in injection_patterns:
-            text = re.sub(pattern, '', text, flags=re.IGNORECASE | re.DOTALL)
+        # Check for prompt injection
+        if InputSanitizer.detect_prompt_injection(text):
+            raise ValueError("Potential prompt injection detected in input")
         
         # Remove excessive whitespace
         text = ' '.join(text.split())
@@ -132,253 +332,91 @@ class InputSanitizer:
         if len(sanitized) < 1:
             raise ValueError("Input text too short after sanitization")
         
-        # Check for suspicious patterns
-        suspicious_patterns = [
-            r'ignore\s+previous\s+instructions',
-            r'disregard\s+all\s+prior',
-            r'forget\s+everything',
-            r'new\s+instructions:',
-            r'system\s+override',
-        ]
-        
-        for pattern in suspicious_patterns:
-            if re.search(pattern, sanitized, re.IGNORECASE):
-                logger.warning(f"Suspicious pattern detected in input: {pattern}")
-                # Remove the suspicious content
-                sanitized = re.sub(pattern, '', sanitized, flags=re.IGNORECASE)
-        
         return sanitized
 
 
-# ==================== API Key Authentication ====================
-api_key_header = APIKeyHeader(name="X-API-Key", auto_error=True)
-
-async def validate_api_key(api_key: str = Security(api_key_header)):
-    """
-    Validate API key from request header.
+# ==================== Content Moderation with AWS Comprehend ====================
+class ContentModerator:
+    """Content moderation using AWS Comprehend."""
     
-    Args:
-        api_key: API key from X-API-Key header
+    def __init__(self, aws_manager):
+        """Initialize content moderator with AWS services."""
+        try:
+            self.comprehend = boto3.client('comprehend', region_name=Config.AWS_REGION)
+            logger.info("Comprehend client initialized for content moderation")
+        except Exception as e:
+            logger.warning(f"Failed to initialize Comprehend client: {e}")
+            self.comprehend = None
+    
+    async def check_content(self, text: str) -> Dict[str, Any]:
+        """
+        Check content for toxic or inappropriate material.
         
-    Returns:
-        The validated API key
+        Args:
+            text: Text to check
+            
+        Returns:
+            Dictionary with moderation results
+        """
+        if not self.comprehend:
+            return {"safe": True, "reason": "Moderation unavailable"}
         
-    Raises:
-        HTTPException: If API key is invalid
-    """
-    if api_key != Config.API_KEY:
-        logger.warning(f"Invalid API key attempt: {api_key[:8]}...")
-        raise HTTPException(
-            status_code=403,
-            detail="Invalid API key"
-        )
-    return api_key
+        try:
+            # Use Comprehend to detect toxic content
+            response = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: self.comprehend.detect_toxic_content(
+                    TextSegments=[{'Text': text[:5000]}],  # Limit to 5000 chars
+                    LanguageCode='en'
+                )
+            )
+            
+            # Check toxicity scores
+            if response.get('ResultList'):
+                result = response['ResultList'][0]
+                labels = result.get('Labels', [])
+                
+                for label in labels:
+                    if label.get('Score', 0) > 0.7:  # High confidence toxic content
+                        logger.warning(f"Toxic content detected: {label.get('Name')}")
+                        return {
+                            "safe": False,
+                            "reason": f"Toxic content detected: {label.get('Name')}",
+                            "score": label.get('Score')
+                        }
+            
+            return {"safe": True}
+            
+        except Exception as e:
+            logger.error(f"Content moderation error: {e}")
+            # Fail open but log the error
+            return {"safe": True, "error": str(e)}
 
 
-# ==================== Data Models ====================
-class SentimentType(str, Enum):
-    """Sentiment classification types."""
-    POSITIVE = "POSITIVE"
-    NEGATIVE = "NEGATIVE"
-    NEUTRAL = "NEUTRAL"
-    MIXED = "MIXED"
-
-
-class EmotionType(str, Enum):
-    """Emotion classification types."""
-    HAPPY = "HAPPY"
-    SAD = "SAD"
-    ANGRY = "ANGRY"
-    CONFUSED = "CONFUSED"
-    DISGUSTED = "DISGUSTED"
-    SURPRISED = "SURPRISED"
-    CALM = "CALM"
-    FEAR = "FEAR"
-
-
-class StreamSource(str, Enum):
-    """Supported streaming sources."""
-    YOUTUBE = "YOUTUBE"
-    TWITCH = "TWITCH"
-    RTMP = "RTMP"
-    CUSTOM = "CUSTOM"
-
-
-class LiveEvent(BaseModel):
-    """Live event configuration."""
-    event_id: str = Field(default_factory=lambda: str(uuid4()))
-    name: str
-    description: Optional[str] = None
-    stream_source: StreamSource
-    stream_url: str
-    start_time: datetime
-    end_time: Optional[datetime] = None
-    status: str = "active"
-    metadata: Dict[str, Any] = Field(default_factory=dict)
-
-
-class SentimentData(BaseModel):
-    """Sentiment analysis result."""
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
-    event_id: str
-    sentiment: SentimentType
-    sentiment_score: float = Field(ge=-1.0, le=1.0)
-    confidence: float = Field(ge=0.0, le=1.0)
-    emotions: Dict[EmotionType, float] = Field(default_factory=dict)
-    text_content: Optional[str] = None
-    source_type: str = "video"  # video, audio, text, combined
-    metadata: Dict[str, Any] = Field(default_factory=dict)
-
-
-class EngagementMetrics(BaseModel):
-    """Real-time engagement metrics."""
-    event_id: str
-    timestamp: datetime
-    viewer_count: int = 0
-    comment_rate: float = 0.0
-    reaction_count: int = 0
-    average_sentiment: float = 0.0
-    dominant_emotion: Optional[EmotionType] = None
-    engagement_score: float = 0.0
-
-
-class Alert(BaseModel):
-    """Sentiment alert configuration."""
-    alert_id: str = Field(default_factory=lambda: str(uuid4()))
-    event_id: str
-    alert_type: str  # sentiment_shift, viral_moment, low_engagement
-    severity: str  # low, medium, high, critical
-    message: str
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
-    data: Dict[str, Any] = Field(default_factory=dict)
-
-
-class Highlight(BaseModel):
-    """Event highlight based on emotional peaks."""
-    highlight_id: str = Field(default_factory=lambda: str(uuid4()))
-    event_id: str
-    start_time: datetime
-    end_time: datetime
-    peak_emotion: EmotionType
-    peak_sentiment_score: float
-    engagement_score: float
-    description: str
-    video_url: Optional[str] = None
-
-
-# ==================== AWS Service Clients ====================
+# ==================== AWS Service Manager ====================
 class AWSServiceManager:
-    """Manages AWS service clients with proper error handling."""
+    """Manages AWS service connections and lifecycle."""
     
     def __init__(self):
-        """Initialize AWS service clients."""
-        self.region = Config.AWS_REGION
+        """Initialize AWS service manager with ThreadPoolExecutor."""
         self.executor = ThreadPoolExecutor(max_workers=10)
-        
-        # Initialize clients with error handling
-        try:
-            self.kinesis_video = boto3.client('kinesisvideo', region_name=self.region)
-            logger.info("Kinesis Video client initialized successfully")
-        except (NoCredentialsError, PartialCredentialsError) as e:
-            logger.error(f"Failed to initialize Kinesis Video client - missing or invalid AWS credentials: {str(e)}")
-            raise
-        except ClientError as e:
-            logger.error(f"Failed to initialize Kinesis Video client - insufficient permissions or service error: {str(e)}")
-            raise
-        except Exception as e:
-            logger.error(f"Failed to initialize Kinesis Video client - unexpected error: {str(e)}")
-            raise
-        
-        try:
-            self.kinesis_data = boto3.client('kinesis', region_name=self.region)
-            logger.info("Kinesis Data client initialized successfully")
-        except (NoCredentialsError, PartialCredentialsError) as e:
-            logger.error(f"Failed to initialize Kinesis Data client - missing or invalid AWS credentials: {str(e)}")
-            raise
-        except ClientError as e:
-            logger.error(f"Failed to initialize Kinesis Data client - insufficient permissions or service error: {str(e)}")
-            raise
-        except Exception as e:
-            logger.error(f"Failed to initialize Kinesis Data client - unexpected error: {str(e)}")
-            raise
-        
-        try:
-            self.dynamodb = boto3.resource('dynamodb', region_name=self.region)
-            logger.info("DynamoDB resource initialized successfully")
-        except (NoCredentialsError, PartialCredentialsError) as e:
-            logger.error(f"Failed to initialize DynamoDB resource - missing or invalid AWS credentials: {str(e)}")
-            raise
-        except ClientError as e:
-            logger.error(f"Failed to initialize DynamoDB resource - insufficient permissions or service error: {str(e)}")
-            raise
-        except Exception as e:
-            logger.error(f"Failed to initialize DynamoDB resource - unexpected error: {str(e)}")
-            raise
-        
-        try:
-            self.rekognition = boto3.client('rekognition', region_name=self.region)
-            logger.info("Rekognition client initialized successfully")
-        except (NoCredentialsError, PartialCredentialsError) as e:
-            logger.error(f"Failed to initialize Rekognition client - missing or invalid AWS credentials: {str(e)}")
-            raise
-        except ClientError as e:
-            logger.error(f"Failed to initialize Rekognition client - insufficient permissions or service error: {str(e)}")
-            raise
-        except Exception as e:
-            logger.error(f"Failed to initialize Rekognition client - unexpected error: {str(e)}")
-            raise
-        
-        try:
-            self.transcribe = boto3.client('transcribe', region_name=self.region)
-            logger.info("Transcribe client initialized successfully")
-        except (NoCredentialsError, PartialCredentialsError) as e:
-            logger.error(f"Failed to initialize Transcribe client - missing or invalid AWS credentials: {str(e)}")
-            raise
-        except ClientError as e:
-            logger.error(f"Failed to initialize Transcribe client - insufficient permissions or service error: {str(e)}")
-            raise
-        except Exception as e:
-            logger.error(f"Failed to initialize Transcribe client - unexpected error: {str(e)}")
-            raise
-        
-        try:
-            self.bedrock_runtime = boto3.client('bedrock-runtime', region_name=self.region)
-            logger.info("Bedrock Runtime client initialized successfully")
-        except (NoCredentialsError, PartialCredentialsError) as e:
-            logger.error(f"Failed to initialize Bedrock Runtime client - missing or invalid AWS credentials: {str(e)}")
-            raise
-        except ClientError as e:
-            logger.error(f"Failed to initialize Bedrock Runtime client - insufficient permissions or service error: {str(e)}")
-            raise
-        except Exception as e:
-            logger.error(f"Failed to initialize Bedrock Runtime client - unexpected error: {str(e)}")
-            raise
-        
-        try:
-            self.s3 = boto3.client('s3', region_name=self.region)
-            logger.info("S3 client initialized successfully")
-        except (NoCredentialsError, PartialCredentialsError) as e:
-            logger.error(f"Failed to initialize S3 client - missing or invalid AWS credentials: {str(e)}")
-            raise
-        except ClientError as e:
-            logger.error(f"Failed to initialize S3 client - insufficient permissions or service error: {str(e)}")
-            raise
-        except Exception as e:
-            logger.error(f"Failed to initialize S3 client - unexpected error: {str(e)}")
-            raise
-        
-        try:
-            self.cloudwatch = boto3.client('cloudwatch', region_name=self.region)
-            logger.info("CloudWatch client initialized successfully")
-        except (NoCredentialsError, PartialCredentialsError) as e:
-            logger.error(f"Failed to initialize CloudWatch client - missing or invalid AWS credentials: {str(e)}")
-            raise
-        except ClientError as e:
-            logger.error(f"Failed to initialize CloudWatch client - insufficient permissions or service error: {str(e)}")
-            raise
-        except Exception as e:
-            logger.error(f"Failed to initialize CloudWatch client - unexpected error: {str(e)}")
-            raise
-        
-        try:
-            self.
+        logger.info("AWSServiceManager initialized with ThreadPoolExecutor")
+    
+    def shutdown(self):
+        """Shutdown the ThreadPoolExecutor and cleanup resources."""
+        logger.info("Shutting down AWSServiceManager")
+        self.executor.shutdown(wait=True)
+        logger.info("ThreadPoolExecutor shutdown complete")
+
+
+# Global AWS service manager instance
+aws_service_manager = None
+
+
+# ==================== Application Lifecycle ====================
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Manage application lifecycle - startup and shutdown."""
+    global aws_service_manager
+    
+    # Startup
