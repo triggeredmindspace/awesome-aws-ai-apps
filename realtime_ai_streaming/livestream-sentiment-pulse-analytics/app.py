@@ -24,12 +24,35 @@ from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field, validator
 import uvicorn
 
-# Configure logging
+
+# ==================== Sensitive Data Filter ====================
+class SensitiveDataFilter(logging.Filter):
+    """Filter to redact sensitive data from logs."""
+    
+    SENSITIVE_KEYS = {'API_KEY', 'AWS_SECRET_ACCESS_KEY', 'AWS_SESSION_TOKEN', 'PASSWORD', 'SECRET', 'TOKEN'}
+    
+    def filter(self, record):
+        """Redact sensitive information from log records."""
+        if hasattr(record, 'msg'):
+            msg = str(record.msg)
+            # Redact any potential API keys or secrets
+            for key in self.SENSITIVE_KEYS:
+                if key in msg:
+                    record.msg = msg.replace(os.environ.get(key, ''), '[REDACTED]')
+        return True
+
+
+# Configure logging with sensitive data filter
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+logger.addFilter(SensitiveDataFilter())
+
+# Create a separate debug logger for internal use
+debug_logger = logging.getLogger(__name__ + '.debug')
+debug_logger.setLevel(logging.DEBUG if os.getenv('DEBUG_MODE', 'false').lower() == 'true' else logging.CRITICAL)
 
 
 # ==================== Configuration ====================
@@ -56,9 +79,44 @@ class Config:
     RATE_LIMIT_WINDOW = int(os.getenv("RATE_LIMIT_WINDOW", "60"))  # Window in seconds
     
     # API_KEY must be set - no default value
-    API_KEY = os.environ.get("API_KEY")
-    if not API_KEY:
-        raise ValueError("API_KEY environment variable must be set")
+    # Retrieve from AWS Secrets Manager if available, otherwise fall back to environment variable
+    _api_key = None
+    
+    @classmethod
+    def get_api_key(cls) -> str:
+        """
+        Retrieve API key from AWS Secrets Manager or environment variable.
+        Never logs the actual key value.
+        """
+        if cls._api_key:
+            return cls._api_key
+            
+        # Try AWS Secrets Manager first
+        try:
+            secrets_client = boto3.client('secretsmanager', region_name=cls.AWS_REGION)
+            response = secrets_client.get_secret_value(SecretId='sentiment-analytics/api-key')
+            secret_data = json.loads(response['SecretString'])
+            cls._api_key = secret_data.get('API_KEY')
+            if cls._api_key:
+                logger.info("API key retrieved from AWS Secrets Manager")
+                return cls._api_key
+        except Exception as e:
+            logger.info("AWS Secrets Manager not available, falling back to environment variable")
+        
+        # Fall back to environment variable
+        cls._api_key = os.environ.get("API_KEY")
+        if not cls._api_key:
+            logger.error("API_KEY not found in Secrets Manager or environment variables")
+            raise ValueError("API_KEY must be set in AWS Secrets Manager or environment variable")
+        
+        logger.info("API key retrieved from environment variable")
+        return cls._api_key
+    
+    @classmethod
+    @property
+    def API_KEY(cls) -> str:
+        """Property to access API key safely."""
+        return cls.get_api_key()
 
 
 # ==================== Rate Limiter ====================
@@ -74,7 +132,7 @@ class RateLimiter:
         Check if client has exceeded rate limit.
         
         Args:
-            client_id: Client identifier (IP address or API key)
+            client_id: Client identifier (IP address or API key hash)
             
         Returns:
             True if request is allowed, False if rate limited
@@ -86,7 +144,7 @@ class RateLimiter:
         if client_id in self.blocked_ips:
             block_until = self.blocked_ips[client_id]
             if now < block_until:
-                logger.warning(f"Blocked client {client_id} attempted request")
+                logger.warning(f"Blocked client attempted request")
                 return False
             else:
                 del self.blocked_ips[client_id]
@@ -99,7 +157,7 @@ class RateLimiter:
         
         # Check rate limit
         if len(self.request_counts[client_id]) >= Config.RATE_LIMIT_REQUESTS:
-            logger.warning(f"Rate limit exceeded for client {client_id}")
+            logger.warning(f"Rate limit exceeded for client")
             # Block for 5 minutes
             self.blocked_ips[client_id] = now + 300
             return False
@@ -124,7 +182,7 @@ class RateLimiter:
         if len(recent_requests) >= 5:
             # If more than 5 requests in last 10, check for suspicious patterns
             if len(text) > Config.MAX_INPUT_LENGTH * 0.9:
-                logger.warning(f"Anomaly detected: Large input from {client_id}")
+                logger.warning(f"Anomaly detected: Large input from client")
                 return True
         
         return False
@@ -163,9 +221,77 @@ class InputSanitizer:
         return text
     
     @staticmethod
+    def is_valid_base64(text: str) -> bool:
+        """
+        Check if text is valid base64 with reasonable structure.
+        
+        Args:
+            text: Text to check
+            
+        Returns:
+            True if valid base64, False otherwise
+        """
+        # Remove whitespace
+        text = text.strip().replace('\n', '').replace('\r', '').replace(' ', '')
+        
+        # Length limits - must be between 16 and 10000 characters
+        if len(text) < 16 or len(text) > 10000:
+            return False
+        
+        # Must be multiple of 4 (with padding)
+        if len(text) % 4 != 0:
+            return False
+        
+        # Check character set - only valid base64 characters
+        if not re.match(r'^[A-Za-z0-9+/]*={0,2}$', text):
+            return False
+        
+        # Padding must be at the end only
+        if '=' in text and not text.endswith('==') and not text.endswith('='):
+            return False
+        
+        # Check for reasonable entropy (not all same character)
+        unique_chars = len(set(text.replace('=', '')))
+        if unique_chars < 4:
+            return False
+        
+        return True
+    
+    @staticmethod
+    def is_valid_decoded_content(decoded: str) -> bool:
+        """
+        Validate decoded content is reasonable text.
+        
+        Args:
+            decoded: Decoded text
+            
+        Returns:
+            True if content is valid, False otherwise
+        """
+        # Must not be empty
+        if not decoded or len(decoded) == 0:
+            return False
+        
+        # Must not be too long
+        if len(decoded) > Config.MAX_INPUT_LENGTH:
+            return False
+        
+        # Check for reasonable printable character ratio
+        printable_ratio = sum(1 for c in decoded if c.isprintable() or c.isspace()) / len(decoded)
+        if printable_ratio < 0.8:
+            return False
+        
+        # Must not contain excessive null bytes or control characters
+        control_chars = sum(1 for c in decoded if ord(c) < 32 and c not in '\n\r\t')
+        if control_chars > len(decoded) * 0.1:
+            return False
+        
+        return True
+    
+    @staticmethod
     def decode_common_encodings(text: str) -> str:
         """
-        Detect and decode common encoding attempts.
+        Detect and decode common encoding attempts with validation.
         
         Args:
             text: Input text
@@ -173,16 +299,35 @@ class InputSanitizer:
         Returns:
             Decoded text
         """
-        # Try to detect base64 encoding
+        original_text = text
+        
+        # Try to detect base64 encoding with strict validation
         try:
-            # Check if text looks like base64
-            if re.match(r'^[A-Za-z0-9+/]+=*$', text.replace('\n', '').replace('\r', '')):
-                decoded = base64.b64decode(text).decode('utf-8', errors='ignore')
-                if decoded and len(decoded) > 0:
-                    logger.warning("Base64 encoded input detected and decoded")
+            # Only attempt decode if it looks like valid base64
+            if InputSanitizer.is_valid_base64(text):
+                decoded_bytes = base64.b64decode(text, validate=True)
+                
+                # Limit decoded size
+                if len(decoded_bytes) > Config.MAX_INPUT_LENGTH:
+                    logger.warning("Base64 decoded content exceeds size limit")
+                    return original_text
+                
+                # Try to decode as UTF-8
+                decoded = decoded_bytes.decode('utf-8', errors='strict')
+                
+                # Validate decoded content
+                if InputSanitizer.is_valid_decoded_content(decoded):
+                    logger.warning("Valid base64 encoded input detected and decoded")
                     text = decoded
-        except Exception:
+                else:
+                    logger.warning("Base64 decoded content failed validation")
+                    return original_text
+        except (base64.binascii.Error, UnicodeDecodeError, ValueError) as e:
+            # Not valid base64 or not valid UTF-8, keep original
             pass
+        except Exception as e:
+            logger.warning(f"Unexpected error during base64 decode: {type(e).__name__}")
+            return original_text
         
         # Decode URL encoding
         try:
@@ -250,173 +395,8 @@ class InputSanitizer:
             r'what\s+(?:are|is)\s+your\s+(?:instructions?|prompts?|rules)',
         ]
         
-        for pattern in injection_patterns:
+        for i, pattern in enumerate(injection_patterns):
             if re.search(pattern, normalized):
-                logger.warning(f"Prompt injection pattern detected: {pattern}")
-                return True
-        
-        # Check for excessive special characters (potential obfuscation)
-        special_char_ratio = sum(1 for c in text if not c.isalnum() and not c.isspace()) / max(len(text), 1)
-        if special_char_ratio > 0.3:
-            logger.warning(f"High special character ratio detected: {special_char_ratio}")
-            return True
-        
-        return False
-    
-    @staticmethod
-    def sanitize_text(text: str, max_length: int = Config.MAX_INPUT_LENGTH) -> str:
-        """
-        Sanitize text input to prevent prompt injection.
-        
-        Args:
-            text: Raw text input
-            max_length: Maximum allowed length
-            
-        Returns:
-            Sanitized text
-            
-        Raises:
-            ValueError: If input is invalid
-        """
-        if not isinstance(text, str):
-            raise ValueError("Input must be a string")
-        
-        # Normalize Unicode
-        text = InputSanitizer.normalize_unicode(text)
-        
-        # Decode common encodings
-        text = InputSanitizer.decode_common_encodings(text)
-        
-        # Limit length
-        if len(text) > max_length:
-            logger.warning(f"Input text truncated from {len(text)} to {max_length} characters")
-            text = text[:max_length]
-        
-        # Remove control characters except common whitespace
-        text = ''.join(char for char in text if char.isprintable() or char in '\n\r\t ')
-        
-        # Check for prompt injection
-        if InputSanitizer.detect_prompt_injection(text):
-            raise ValueError("Potential prompt injection detected in input")
-        
-        # Remove excessive whitespace
-        text = ' '.join(text.split())
-        
-        # Final validation
-        if not text or len(text.strip()) == 0:
-            raise ValueError("Input text is empty after sanitization")
-        
-        return text.strip()
-    
-    @staticmethod
-    def validate_and_sanitize(text: str) -> str:
-        """
-        Validate and sanitize text input with comprehensive checks.
-        
-        Args:
-            text: Raw text input
-            
-        Returns:
-            Sanitized and validated text
-            
-        Raises:
-            ValueError: If input fails validation
-        """
-        if text is None:
-            raise ValueError("Input text cannot be None")
-        
-        # Sanitize
-        sanitized = InputSanitizer.sanitize_text(text)
-        
-        # Additional validation
-        if len(sanitized) < 1:
-            raise ValueError("Input text too short after sanitization")
-        
-        return sanitized
-
-
-# ==================== Content Moderation with AWS Comprehend ====================
-class ContentModerator:
-    """Content moderation using AWS Comprehend."""
-    
-    def __init__(self, aws_manager):
-        """Initialize content moderator with AWS services."""
-        try:
-            self.comprehend = boto3.client('comprehend', region_name=Config.AWS_REGION)
-            logger.info("Comprehend client initialized for content moderation")
-        except Exception as e:
-            logger.warning(f"Failed to initialize Comprehend client: {e}")
-            self.comprehend = None
-    
-    async def check_content(self, text: str) -> Dict[str, Any]:
-        """
-        Check content for toxic or inappropriate material.
-        
-        Args:
-            text: Text to check
-            
-        Returns:
-            Dictionary with moderation results
-        """
-        if not self.comprehend:
-            return {"safe": True, "reason": "Moderation unavailable"}
-        
-        try:
-            # Use Comprehend to detect toxic content
-            response = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: self.comprehend.detect_toxic_content(
-                    TextSegments=[{'Text': text[:5000]}],  # Limit to 5000 chars
-                    LanguageCode='en'
-                )
-            )
-            
-            # Check toxicity scores
-            if response.get('ResultList'):
-                result = response['ResultList'][0]
-                labels = result.get('Labels', [])
-                
-                for label in labels:
-                    if label.get('Score', 0) > 0.7:  # High confidence toxic content
-                        logger.warning(f"Toxic content detected: {label.get('Name')}")
-                        return {
-                            "safe": False,
-                            "reason": f"Toxic content detected: {label.get('Name')}",
-                            "score": label.get('Score')
-                        }
-            
-            return {"safe": True}
-            
-        except Exception as e:
-            logger.error(f"Content moderation error: {e}")
-            # Fail open but log the error
-            return {"safe": True, "error": str(e)}
-
-
-# ==================== AWS Service Manager ====================
-class AWSServiceManager:
-    """Manages AWS service connections and lifecycle."""
-    
-    def __init__(self):
-        """Initialize AWS service manager with ThreadPoolExecutor."""
-        self.executor = ThreadPoolExecutor(max_workers=10)
-        logger.info("AWSServiceManager initialized with ThreadPoolExecutor")
-    
-    def shutdown(self):
-        """Shutdown the ThreadPoolExecutor and cleanup resources."""
-        logger.info("Shutting down AWSServiceManager")
-        self.executor.shutdown(wait=True)
-        logger.info("ThreadPoolExecutor shutdown complete")
-
-
-# Global AWS service manager instance
-aws_service_manager = None
-
-
-# ==================== Application Lifecycle ====================
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Manage application lifecycle - startup and shutdown."""
-    global aws_service_manager
-    
-    # Startup
+                # Log generic message for production
+                logger.warning("Potential prompt injection attempt detected in user input")
+                return
