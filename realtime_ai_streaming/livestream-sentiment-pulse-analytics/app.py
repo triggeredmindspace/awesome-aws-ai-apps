@@ -27,18 +27,47 @@ import uvicorn
 
 # ==================== Sensitive Data Filter ====================
 class SensitiveDataFilter(logging.Filter):
-    """Filter to redact sensitive data from logs."""
+    """Filter to redact sensitive data from logs using pattern matching."""
     
-    SENSITIVE_KEYS = {'API_KEY', 'AWS_SECRET_ACCESS_KEY', 'AWS_SESSION_TOKEN', 'PASSWORD', 'SECRET', 'TOKEN'}
+    # Regex patterns to detect sensitive data formats
+    PATTERNS = {
+        'aws_access_key': re.compile(r'AKIA[0-9A-Z]{16}'),
+        'aws_secret_key': re.compile(r'(?i)aws_secret[_\s]*(?:access[_\s]*)?key[_\s]*[=:]\s*["\']?([A-Za-z0-9/+=]{40})["\']?'),
+        'api_key': re.compile(r'(?i)api[_\s]*key[_\s]*[=:]\s*["\']?([A-Za-z0-9_\-]{20,})["\']?'),
+        'bearer_token': re.compile(r'Bearer\s+[A-Za-z0-9\-._~+/]+=*'),
+        'password': re.compile(r'(?i)password[_\s]*[=:]\s*["\']?([^\s"\']{8,})["\']?'),
+        'secret': re.compile(r'(?i)secret[_\s]*[=:]\s*["\']?([A-Za-z0-9/+=]{16,})["\']?'),
+        'token': re.compile(r'(?i)token[_\s]*[=:]\s*["\']?([A-Za-z0-9_\-\.]{20,})["\']?'),
+        'jwt': re.compile(r'eyJ[A-Za-z0-9_-]*\.eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]*'),
+        'private_key': re.compile(r'-----BEGIN (?:RSA |EC )?PRIVATE KEY-----'),
+        'session_token': re.compile(r'(?i)session[_\s]*token[_\s]*[=:]\s*["\']?([A-Za-z0-9/+=]{20,})["\']?'),
+    }
     
     def filter(self, record):
-        """Redact sensitive information from log records."""
+        """Redact sensitive information from log records using pattern matching."""
         if hasattr(record, 'msg'):
             msg = str(record.msg)
-            # Redact any potential API keys or secrets
-            for key in self.SENSITIVE_KEYS:
-                if key in msg:
-                    record.msg = msg.replace(os.environ.get(key, ''), '[REDACTED]')
+            
+            # Apply each pattern to redact sensitive data
+            for pattern_name, pattern in self.PATTERNS.items():
+                msg = pattern.sub('[REDACTED]', msg)
+            
+            record.msg = msg
+        
+        # Also check args if present
+        if hasattr(record, 'args') and record.args:
+            try:
+                sanitized_args = []
+                for arg in record.args:
+                    arg_str = str(arg)
+                    for pattern_name, pattern in self.PATTERNS.items():
+                        arg_str = pattern.sub('[REDACTED]', arg_str)
+                    sanitized_args.append(arg_str)
+                record.args = tuple(sanitized_args)
+            except Exception:
+                # If sanitization fails, keep original to avoid breaking logging
+                pass
+        
         return True
 
 
@@ -112,11 +141,10 @@ class Config:
         logger.info("API key retrieved from environment variable")
         return cls._api_key
     
-    @classmethod
     @property
-    def API_KEY(cls) -> str:
+    def API_KEY(self) -> str:
         """Property to access API key safely."""
-        return cls.get_api_key()
+        return self.get_api_key()
 
 
 # ==================== Rate Limiter ====================
@@ -344,59 +372,4 @@ class InputSanitizer:
             import html
             decoded = html.unescape(text)
             if decoded != text:
-                logger.warning("HTML encoded input detected and decoded")
-                text = decoded
-        except Exception:
-            pass
-        
-        return text
-    
-    @staticmethod
-    def detect_prompt_injection(text: str) -> bool:
-        """
-        Detect prompt injection attempts using multiple techniques.
-        
-        Args:
-            text: Input text to check
-            
-        Returns:
-            True if injection detected, False otherwise
-        """
-        # Normalize text for detection (lowercase, remove extra spaces)
-        normalized = ' '.join(text.lower().split())
-        
-        # Comprehensive injection patterns
-        injection_patterns = [
-            # Instruction override attempts
-            r'ignore\s+(?:previous|prior|all|above)\s+(?:instructions?|prompts?|commands?)',
-            r'disregard\s+(?:previous|prior|all|above)',
-            r'forget\s+(?:previous|prior|all|above|everything)',
-            r'new\s+(?:instructions?|prompts?|commands?)\s*:',
-            r'system\s+(?:override|prompt|instruction)',
-            
-            # Role manipulation
-            r'you\s+are\s+(?:now|a)\s+(?:developer|admin|root|system)',
-            r'act\s+as\s+(?:a\s+)?(?:developer|admin|root|system)',
-            r'pretend\s+(?:to\s+be|you\s+are)',
-            
-            # Delimiter injection
-            r'<\|.*?\|>',
-            r'\[(?:INST|SYS|SYSTEM)\]',
-            r'###\s*(?:system|assistant|human|user)\s*:',
-            r'human\s*:\s*.*?\s*assistant\s*:',
-            
-            # Jailbreak attempts
-            r'jailbreak',
-            r'dan\s+mode',
-            r'developer\s+mode',
-            
-            # Prompt leaking
-            r'(?:show|reveal|display|print)\s+(?:your|the)\s+(?:prompt|instructions?|system\s+message)',
-            r'what\s+(?:are|is)\s+your\s+(?:instructions?|prompts?|rules)',
-        ]
-        
-        for i, pattern in enumerate(injection_patterns):
-            if re.search(pattern, normalized):
-                # Log generic message for production
-                logger.warning("Potential prompt injection attempt detected in user input")
-                return
+                logger.warning("HTML
