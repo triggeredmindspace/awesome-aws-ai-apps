@@ -12,12 +12,13 @@ from enum import Enum
 from typing import Any, Dict, List, Optional, Set
 from uuid import uuid4
 from concurrent.futures import ThreadPoolExecutor
-from collections import defaultdict
+from collections import OrderedDict
 from contextlib import asynccontextmanager
+import hashlib
 
 import boto3
 from botocore.exceptions import ClientError, NoCredentialsError, PartialCredentialsError
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, BackgroundTasks, Security, Depends
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, BackgroundTasks, Security, Depends, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.security import APIKeyHeader
@@ -106,6 +107,11 @@ class Config:
     MAX_INPUT_LENGTH = int(os.getenv("MAX_INPUT_LENGTH", "10000"))  # Maximum input text length
     RATE_LIMIT_REQUESTS = int(os.getenv("RATE_LIMIT_REQUESTS", "100"))  # Requests per window
     RATE_LIMIT_WINDOW = int(os.getenv("RATE_LIMIT_WINDOW", "60"))  # Window in seconds
+    RATE_LIMITER_MAX_CLIENTS = int(os.getenv("RATE_LIMITER_MAX_CLIENTS", "10000"))  # Maximum tracked clients
+    MAX_DECODE_DEPTH = int(os.getenv("MAX_DECODE_DEPTH", "2"))  # Maximum recursive decode depth
+    MAX_DECODE_TIME_MS = int(os.getenv("MAX_DECODE_TIME_MS", "100"))  # Maximum decode processing time
+    ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "").split(",") if os.getenv("ALLOWED_ORIGINS") else []
+    WEBSOCKET_MAX_CONNECTIONS = int(os.getenv("WEBSOCKET_MAX_CONNECTIONS", "1000"))
     
     # API_KEY must be set - no default value
     # Retrieve from AWS Secrets Manager if available, otherwise fall back to environment variable
@@ -149,12 +155,85 @@ class Config:
 
 # ==================== Rate Limiter ====================
 class RateLimiter:
-    """Rate limiting and anomaly detection for API requests."""
+    """Rate limiting and anomaly detection for API requests with bounded memory."""
+    
+    # Injection attack patterns
+    SQL_KEYWORDS = [
+        'SELECT', 'INSERT', 'UPDATE', 'DELETE', 'DROP', 'CREATE', 'ALTER', 'EXEC', 'EXECUTE',
+        'UNION', 'JOIN', 'WHERE', 'FROM', 'TABLE', '--', ';--', '/*', '*/', 'xp_', 'sp_',
+        'INFORMATION_SCHEMA', 'SYSOBJECTS', 'SYSCOLUMNS'
+    ]
+    
+    SCRIPT_PATTERNS = [
+        re.compile(r'<script[^>]*>.*?</script>', re.IGNORECASE | re.DOTALL),
+        re.compile(r'javascript:', re.IGNORECASE),
+        re.compile(r'on\w+\s*=', re.IGNORECASE),  # Event handlers like onclick=
+        re.compile(r'<iframe[^>]*>', re.IGNORECASE),
+        re.compile(r'<object[^>]*>', re.IGNORECASE),
+        re.compile(r'<embed[^>]*>', re.IGNORECASE),
+    ]
+    
+    COMMAND_INJECTION_PATTERNS = [
+        re.compile(r'[;&|`$]'),  # Shell metacharacters
+        re.compile(r'\$\(.*?\)'),  # Command substitution
+        re.compile(r'`.*?`'),  # Backtick command execution
+        re.compile(r'\|\s*\w+'),  # Pipe to command
+        re.compile(r'&&|\|\|'),  # Command chaining
+    ]
     
     def __init__(self):
-        self.request_counts = defaultdict(list)
-        self.blocked_ips = {}
+        self.request_counts = OrderedDict()
+        self.blocked_ips = OrderedDict()
+        self.max_clients = Config.RATE_LIMITER_MAX_CLIENTS
+        self.last_cleanup = time.time()
+        self.cleanup_interval = 300  # Cleanup every 5 minutes
         
+    def _cleanup_old_entries(self):
+        """Periodically cleanup old entries to prevent memory exhaustion."""
+        now = time.time()
+        
+        # Only cleanup if interval has passed
+        if now - self.last_cleanup < self.cleanup_interval:
+            return
+        
+        self.last_cleanup = now
+        window_start = now - Config.RATE_LIMIT_WINDOW
+        
+        # Clean old request counts
+        clients_to_remove = []
+        for client_id, timestamps in self.request_counts.items():
+            # Remove old timestamps
+            self.request_counts[client_id] = [
+                ts for ts in timestamps if ts > window_start
+            ]
+            # Mark empty entries for removal
+            if not self.request_counts[client_id]:
+                clients_to_remove.append(client_id)
+        
+        for client_id in clients_to_remove:
+            del self.request_counts[client_id]
+        
+        # Clean expired blocks
+        expired_blocks = [
+            client_id for client_id, block_until in self.blocked_ips.items()
+            if now >= block_until
+        ]
+        for client_id in expired_blocks:
+            del self.blocked_ips[client_id]
+        
+        logger.info(f"Rate limiter cleanup: {len(clients_to_remove)} inactive clients, {len(expired_blocks)} expired blocks removed")
+    
+    def _enforce_size_limit(self):
+        """Enforce maximum number of tracked clients using LRU eviction."""
+        # Remove oldest entries if we exceed the limit
+        while len(self.request_counts) > self.max_clients:
+            # Remove oldest (first) entry
+            self.request_counts.popitem(last=False)
+            logger.warning("Rate limiter at capacity, evicting oldest client")
+        
+        while len(self.blocked_ips) > self.max_clients:
+            self.blocked_ips.popitem(last=False)
+    
     def check_rate_limit(self, client_id: str) -> bool:
         """
         Check if client has exceeded rate limit.
@@ -168,14 +247,26 @@ class RateLimiter:
         now = time.time()
         window_start = now - Config.RATE_LIMIT_WINDOW
         
+        # Periodic cleanup
+        self._cleanup_old_entries()
+        
         # Check if client is blocked
         if client_id in self.blocked_ips:
             block_until = self.blocked_ips[client_id]
             if now < block_until:
                 logger.warning(f"Blocked client attempted request")
+                # Move to end (most recently used)
+                self.blocked_ips.move_to_end(client_id)
                 return False
             else:
                 del self.blocked_ips[client_id]
+        
+        # Initialize or get existing request list
+        if client_id not in self.request_counts:
+            self.request_counts[client_id] = []
+        
+        # Move to end (most recently used)
+        self.request_counts.move_to_end(client_id)
         
         # Clean old requests
         self.request_counts[client_id] = [
@@ -188,188 +279,38 @@ class RateLimiter:
             logger.warning(f"Rate limit exceeded for client")
             # Block for 5 minutes
             self.blocked_ips[client_id] = now + 300
+            self._enforce_size_limit()
             return False
         
         # Add current request
         self.request_counts[client_id].append(now)
+        
+        # Enforce size limits
+        self._enforce_size_limit()
+        
         return True
     
-    def detect_anomaly(self, client_id: str, text: str) -> bool:
-        """
-        Detect anomalous behavior patterns.
+    def _check_sql_injection(self, text: str) -> bool:
+        """Check for SQL injection patterns."""
+        text_upper = text.upper()
         
-        Args:
-            client_id: Client identifier
-            text: Input text to analyze
-            
-        Returns:
-            True if anomaly detected, False otherwise
-        """
-        # Check for repeated identical requests (potential attack)
-        recent_requests = self.request_counts[client_id][-10:]
-        if len(recent_requests) >= 5:
-            # If more than 5 requests in last 10, check for suspicious patterns
-            if len(text) > Config.MAX_INPUT_LENGTH * 0.9:
-                logger.warning(f"Anomaly detected: Large input from client")
-                return True
+        # Check for SQL keywords
+        keyword_count = sum(1 for keyword in self.SQL_KEYWORDS if keyword in text_upper)
+        if keyword_count >= 2:  # Multiple SQL keywords suggest injection attempt
+            logger.warning(f"SQL injection pattern detected: {keyword_count} SQL keywords found")
+            return True
+        
+        # Check for SQL comment patterns
+        if '--' in text or '/*' in text or '*/' in text:
+            logger.warning("SQL injection pattern detected: SQL comment syntax")
+            return True
         
         return False
-
-
-# ==================== Input Sanitization ====================
-class InputSanitizer:
-    """Sanitizes user input to prevent prompt injection and other attacks."""
     
-    @staticmethod
-    def normalize_unicode(text: str) -> str:
-        """
-        Normalize Unicode characters to prevent Unicode-based bypasses.
-        
-        Args:
-            text: Input text
-            
-        Returns:
-            Normalized text
-        """
-        # Normalize to NFKC form (compatibility decomposition + canonical composition)
-        text = unicodedata.normalize('NFKC', text)
-        
-        # Remove zero-width characters and other invisible Unicode
-        invisible_chars = [
-            '\u200b',  # Zero-width space
-            '\u200c',  # Zero-width non-joiner
-            '\u200d',  # Zero-width joiner
-            '\ufeff',  # Zero-width no-break space
-            '\u2060',  # Word joiner
-            '\u180e',  # Mongolian vowel separator
-        ]
-        for char in invisible_chars:
-            text = text.replace(char, '')
-        
-        return text
-    
-    @staticmethod
-    def is_valid_base64(text: str) -> bool:
-        """
-        Check if text is valid base64 with reasonable structure.
-        
-        Args:
-            text: Text to check
-            
-        Returns:
-            True if valid base64, False otherwise
-        """
-        # Remove whitespace
-        text = text.strip().replace('\n', '').replace('\r', '').replace(' ', '')
-        
-        # Length limits - must be between 16 and 10000 characters
-        if len(text) < 16 or len(text) > 10000:
-            return False
-        
-        # Must be multiple of 4 (with padding)
-        if len(text) % 4 != 0:
-            return False
-        
-        # Check character set - only valid base64 characters
-        if not re.match(r'^[A-Za-z0-9+/]*={0,2}$', text):
-            return False
-        
-        # Padding must be at the end only
-        if '=' in text and not text.endswith('==') and not text.endswith('='):
-            return False
-        
-        # Check for reasonable entropy (not all same character)
-        unique_chars = len(set(text.replace('=', '')))
-        if unique_chars < 4:
-            return False
-        
-        return True
-    
-    @staticmethod
-    def is_valid_decoded_content(decoded: str) -> bool:
-        """
-        Validate decoded content is reasonable text.
-        
-        Args:
-            decoded: Decoded text
-            
-        Returns:
-            True if content is valid, False otherwise
-        """
-        # Must not be empty
-        if not decoded or len(decoded) == 0:
-            return False
-        
-        # Must not be too long
-        if len(decoded) > Config.MAX_INPUT_LENGTH:
-            return False
-        
-        # Check for reasonable printable character ratio
-        printable_ratio = sum(1 for c in decoded if c.isprintable() or c.isspace()) / len(decoded)
-        if printable_ratio < 0.8:
-            return False
-        
-        # Must not contain excessive null bytes or control characters
-        control_chars = sum(1 for c in decoded if ord(c) < 32 and c not in '\n\r\t')
-        if control_chars > len(decoded) * 0.1:
-            return False
-        
-        return True
-    
-    @staticmethod
-    def decode_common_encodings(text: str) -> str:
-        """
-        Detect and decode common encoding attempts with validation.
-        
-        Args:
-            text: Input text
-            
-        Returns:
-            Decoded text
-        """
-        original_text = text
-        
-        # Try to detect base64 encoding with strict validation
-        try:
-            # Only attempt decode if it looks like valid base64
-            if InputSanitizer.is_valid_base64(text):
-                decoded_bytes = base64.b64decode(text, validate=True)
-                
-                # Limit decoded size
-                if len(decoded_bytes) > Config.MAX_INPUT_LENGTH:
-                    logger.warning("Base64 decoded content exceeds size limit")
-                    return original_text
-                
-                # Try to decode as UTF-8
-                decoded = decoded_bytes.decode('utf-8', errors='strict')
-                
-                # Validate decoded content
-                if InputSanitizer.is_valid_decoded_content(decoded):
-                    logger.warning("Valid base64 encoded input detected and decoded")
-                    text = decoded
-                else:
-                    logger.warning("Base64 decoded content failed validation")
-                    return original_text
-        except (base64.binascii.Error, UnicodeDecodeError, ValueError) as e:
-            # Not valid base64 or not valid UTF-8, keep original
-            pass
-        except Exception as e:
-            logger.warning(f"Unexpected error during base64 decode: {type(e).__name__}")
-            return original_text
-        
-        # Decode URL encoding
-        try:
-            import urllib.parse
-            decoded = urllib.parse.unquote(text)
-            if decoded != text:
-                logger.warning("URL encoded input detected and decoded")
-                text = decoded
-        except Exception:
-            pass
-        
-        # Decode HTML entities
-        try:
-            import html
-            decoded = html.unescape(text)
-            if decoded != text:
-                logger.warning("HTML
+    def _check_xss(self, text: str) -> bool:
+        """Check for XSS (Cross-Site Scripting) patterns."""
+        for pattern in self.SCRIPT_PATTERNS:
+            if pattern.search(text):
+                logger.warning("XSS pattern detected: script or event handler")
+                return True
+        return False
