@@ -24,6 +24,303 @@ from fastapi.responses import JSONResponse
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field, validator
 import uvicorn
+import bleach
+
+
+# ==================== Input Validation Framework ====================
+class InputValidator:
+    """Centralized input validation and sanitization framework."""
+    
+    # Allowed HTML tags and attributes for sanitization
+    ALLOWED_TAGS = ['p', 'br', 'strong', 'em', 'u', 'a', 'ul', 'ol', 'li']
+    ALLOWED_ATTRIBUTES = {'a': ['href', 'title']}
+    ALLOWED_PROTOCOLS = ['http', 'https']
+    
+    # Validation patterns
+    EMAIL_PATTERN = re.compile(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$')
+    ALPHANUMERIC_PATTERN = re.compile(r'^[a-zA-Z0-9_-]+$')
+    UUID_PATTERN = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.IGNORECASE)
+    
+    # Dangerous patterns
+    SQL_INJECTION_PATTERNS = [
+        re.compile(r"(\bSELECT\b|\bINSERT\b|\bUPDATE\b|\bDELETE\b|\bDROP\b|\bCREATE\b|\bALTER\b|\bEXEC\b|\bUNION\b)", re.IGNORECASE),
+        re.compile(r"(--|;--|/\*|\*/|xp_|sp_)", re.IGNORECASE),
+        re.compile(r"(\bOR\b\s+\d+\s*=\s*\d+|\bAND\b\s+\d+\s*=\s*\d+)", re.IGNORECASE),
+    ]
+    
+    XSS_PATTERNS = [
+        re.compile(r'<script[^>]*>.*?</script>', re.IGNORECASE | re.DOTALL),
+        re.compile(r'javascript:', re.IGNORECASE),
+        re.compile(r'on\w+\s*=', re.IGNORECASE),
+        re.compile(r'<iframe[^>]*>', re.IGNORECASE),
+    ]
+    
+    COMMAND_INJECTION_PATTERNS = [
+        re.compile(r'[;&|`$]'),
+        re.compile(r'\$\(.*?\)'),
+        re.compile(r'`.*?`'),
+    ]
+    
+    @classmethod
+    def sanitize_html(cls, text: str) -> str:
+        """Sanitize HTML content using bleach library."""
+        if not text:
+            return ""
+        
+        return bleach.clean(
+            text,
+            tags=cls.ALLOWED_TAGS,
+            attributes=cls.ALLOWED_ATTRIBUTES,
+            protocols=cls.ALLOWED_PROTOCOLS,
+            strip=True
+        )
+    
+    @classmethod
+    def validate_string(cls, value: str, field_name: str, max_length: int = None, 
+                       min_length: int = 0, pattern: re.Pattern = None,
+                       allow_empty: bool = False) -> str:
+        """
+        Validate and sanitize string input.
+        
+        Args:
+            value: Input string to validate
+            field_name: Name of the field for error messages
+            max_length: Maximum allowed length
+            min_length: Minimum required length
+            pattern: Regex pattern to match
+            allow_empty: Whether empty strings are allowed
+            
+        Returns:
+            Validated and sanitized string
+            
+        Raises:
+            ValueError: If validation fails
+        """
+        if value is None:
+            if allow_empty:
+                return ""
+            raise ValueError(f"{field_name} cannot be None")
+        
+        # Convert to string and normalize
+        value = str(value).strip()
+        
+        # Check empty
+        if not value and not allow_empty:
+            raise ValueError(f"{field_name} cannot be empty")
+        
+        # Check length
+        if min_length and len(value) < min_length:
+            raise ValueError(f"{field_name} must be at least {min_length} characters")
+        
+        if max_length and len(value) > max_length:
+            raise ValueError(f"{field_name} exceeds maximum length of {max_length}")
+        
+        # Check pattern
+        if pattern and not pattern.match(value):
+            raise ValueError(f"{field_name} format is invalid")
+        
+        # Check for injection attacks
+        cls.check_injection_attacks(value, field_name)
+        
+        return value
+    
+    @classmethod
+    def check_injection_attacks(cls, value: str, field_name: str):
+        """
+        Check for common injection attack patterns.
+        
+        Args:
+            value: Input to check
+            field_name: Field name for error messages
+            
+        Raises:
+            ValueError: If injection pattern detected
+        """
+        # SQL Injection
+        for pattern in cls.SQL_INJECTION_PATTERNS:
+            if pattern.search(value):
+                raise ValueError(f"{field_name} contains potentially malicious SQL patterns")
+        
+        # XSS
+        for pattern in cls.XSS_PATTERNS:
+            if pattern.search(value):
+                raise ValueError(f"{field_name} contains potentially malicious script patterns")
+        
+        # Command Injection
+        for pattern in cls.COMMAND_INJECTION_PATTERNS:
+            if pattern.search(value):
+                raise ValueError(f"{field_name} contains potentially malicious command patterns")
+    
+    @classmethod
+    def validate_integer(cls, value: Any, field_name: str, min_value: int = None, 
+                        max_value: int = None) -> int:
+        """
+        Validate integer input.
+        
+        Args:
+            value: Input to validate
+            field_name: Field name for error messages
+            min_value: Minimum allowed value
+            max_value: Maximum allowed value
+            
+        Returns:
+            Validated integer
+            
+        Raises:
+            ValueError: If validation fails
+        """
+        try:
+            int_value = int(value)
+        except (TypeError, ValueError):
+            raise ValueError(f"{field_name} must be a valid integer")
+        
+        if min_value is not None and int_value < min_value:
+            raise ValueError(f"{field_name} must be at least {min_value}")
+        
+        if max_value is not None and int_value > max_value:
+            raise ValueError(f"{field_name} must be at most {max_value}")
+        
+        return int_value
+    
+    @classmethod
+    def validate_float(cls, value: Any, field_name: str, min_value: float = None, 
+                      max_value: float = None) -> float:
+        """
+        Validate float input.
+        
+        Args:
+            value: Input to validate
+            field_name: Field name for error messages
+            min_value: Minimum allowed value
+            max_value: Maximum allowed value
+            
+        Returns:
+            Validated float
+            
+        Raises:
+            ValueError: If validation fails
+        """
+        try:
+            float_value = float(value)
+        except (TypeError, ValueError):
+            raise ValueError(f"{field_name} must be a valid number")
+        
+        if min_value is not None and float_value < min_value:
+            raise ValueError(f"{field_name} must be at least {min_value}")
+        
+        if max_value is not None and float_value > max_value:
+            raise ValueError(f"{field_name} must be at most {max_value}")
+        
+        return float_value
+    
+    @classmethod
+    def validate_email(cls, email: str) -> str:
+        """
+        Validate email address format.
+        
+        Args:
+            email: Email address to validate
+            
+        Returns:
+            Validated email
+            
+        Raises:
+            ValueError: If email format is invalid
+        """
+        email = cls.validate_string(email, "email", max_length=254)
+        
+        if not cls.EMAIL_PATTERN.match(email):
+            raise ValueError("Invalid email format")
+        
+        return email.lower()
+    
+    @classmethod
+    def validate_uuid(cls, uuid_str: str, field_name: str = "UUID") -> str:
+        """
+        Validate UUID format.
+        
+        Args:
+            uuid_str: UUID string to validate
+            field_name: Field name for error messages
+            
+        Returns:
+            Validated UUID string
+            
+        Raises:
+            ValueError: If UUID format is invalid
+        """
+        uuid_str = cls.validate_string(uuid_str, field_name, max_length=36)
+        
+        if not cls.UUID_PATTERN.match(uuid_str):
+            raise ValueError(f"{field_name} must be a valid UUID")
+        
+        return uuid_str.lower()
+    
+    @classmethod
+    def validate_dict(cls, data: Any, field_name: str, required_keys: List[str] = None,
+                     max_keys: int = 100) -> Dict:
+        """
+        Validate dictionary input.
+        
+        Args:
+            data: Input to validate
+            field_name: Field name for error messages
+            required_keys: List of required keys
+            max_keys: Maximum number of keys allowed
+            
+        Returns:
+            Validated dictionary
+            
+        Raises:
+            ValueError: If validation fails
+        """
+        if not isinstance(data, dict):
+            raise ValueError(f"{field_name} must be a dictionary")
+        
+        if len(data) > max_keys:
+            raise ValueError(f"{field_name} exceeds maximum of {max_keys} keys")
+        
+        if required_keys:
+            missing_keys = set(required_keys) - set(data.keys())
+            if missing_keys:
+                raise ValueError(f"{field_name} missing required keys: {missing_keys}")
+        
+        return data
+    
+    @classmethod
+    def validate_list(cls, data: Any, field_name: str, max_items: int = 1000,
+                     item_validator: callable = None) -> List:
+        """
+        Validate list input.
+        
+        Args:
+            data: Input to validate
+            field_name: Field name for error messages
+            max_items: Maximum number of items allowed
+            item_validator: Optional function to validate each item
+            
+        Returns:
+            Validated list
+            
+        Raises:
+            ValueError: If validation fails
+        """
+        if not isinstance(data, list):
+            raise ValueError(f"{field_name} must be a list")
+        
+        if len(data) > max_items:
+            raise ValueError(f"{field_name} exceeds maximum of {max_items} items")
+        
+        if item_validator:
+            validated_items = []
+            for i, item in enumerate(data):
+                try:
+                    validated_items.append(item_validator(item))
+                except ValueError as e:
+                    raise ValueError(f"{field_name}[{i}]: {str(e)}")
+            return validated_items
+        
+        return data
 
 
 # ==================== Sensitive Data Filter ====================
@@ -94,223 +391,4 @@ class Config:
     KINESIS_DATA_STREAM = os.getenv("KINESIS_DATA_STREAM", "sentiment-data-stream")
     DYNAMODB_TABLE = os.getenv("DYNAMODB_TABLE", "sentiment-analytics")
     DYNAMODB_EVENTS_TABLE = os.getenv("DYNAMODB_EVENTS_TABLE", "live-events")
-    DYNAMODB_HIGHLIGHTS_TABLE = os.getenv("DYNAMODB_HIGHLIGHTS_TABLE", "event-highlights")
-    S3_BUCKET = os.getenv("S3_BUCKET", "sentiment-analytics-data")
-    BEDROCK_MODEL_ID = os.getenv("BEDROCK_MODEL_ID", "anthropic.claude-3-sonnet-20240229-v1:0")
-    ALERT_SNS_TOPIC = os.getenv("ALERT_SNS_TOPIC", "")
-    CLOUDWATCH_NAMESPACE = os.getenv("CLOUDWATCH_NAMESPACE", "SentimentAnalytics")
-    SENTIMENT_THRESHOLD_NEGATIVE = float(os.getenv("SENTIMENT_THRESHOLD_NEGATIVE", "-0.5"))
-    SENTIMENT_THRESHOLD_POSITIVE = float(os.getenv("SENTIMENT_THRESHOLD_POSITIVE", "0.5"))
-    VIRAL_MOMENT_THRESHOLD = int(os.getenv("VIRAL_MOMENT_THRESHOLD", "100"))
-    S3_ENCRYPTION_TYPE = os.getenv("S3_ENCRYPTION_TYPE", "AES256")  # AES256 or aws:kms
-    S3_KMS_KEY_ID = os.getenv("S3_KMS_KEY_ID", "")  # Optional KMS key ID for aws:kms encryption
-    MAX_INPUT_LENGTH = int(os.getenv("MAX_INPUT_LENGTH", "10000"))  # Maximum input text length
-    RATE_LIMIT_REQUESTS = int(os.getenv("RATE_LIMIT_REQUESTS", "100"))  # Requests per window
-    RATE_LIMIT_WINDOW = int(os.getenv("RATE_LIMIT_WINDOW", "60"))  # Window in seconds
-    RATE_LIMITER_MAX_CLIENTS = int(os.getenv("RATE_LIMITER_MAX_CLIENTS", "10000"))  # Maximum tracked clients
-    MAX_DECODE_DEPTH = int(os.getenv("MAX_DECODE_DEPTH", "2"))  # Maximum recursive decode depth
-    MAX_DECODE_TIME_MS = int(os.getenv("MAX_DECODE_TIME_MS", "100"))  # Maximum decode processing time
-    ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "").split(",") if os.getenv("ALLOWED_ORIGINS") else []
-    WEBSOCKET_MAX_CONNECTIONS = int(os.getenv("WEBSOCKET_MAX_CONNECTIONS", "1000"))
-    
-    # API_KEY must be set - no default value
-    # Retrieve from AWS Secrets Manager if available, otherwise fall back to environment variable
-    _api_key = None
-    
-    @classmethod
-    def get_api_key(cls) -> str:
-        """
-        Retrieve API key from AWS Secrets Manager or environment variable.
-        Never logs the actual key value.
-        """
-        if cls._api_key:
-            return cls._api_key
-            
-        # Try AWS Secrets Manager first
-        try:
-            secrets_client = boto3.client('secretsmanager', region_name=cls.AWS_REGION)
-            response = secrets_client.get_secret_value(SecretId='sentiment-analytics/api-key')
-            secret_data = json.loads(response['SecretString'])
-            cls._api_key = secret_data.get('API_KEY')
-            if cls._api_key:
-                logger.info("API key retrieved from AWS Secrets Manager")
-                return cls._api_key
-        except Exception as e:
-            logger.info("AWS Secrets Manager not available, falling back to environment variable")
-        
-        # Fall back to environment variable
-        cls._api_key = os.environ.get("API_KEY")
-        if not cls._api_key:
-            logger.error("API_KEY not found in Secrets Manager or environment variables")
-            raise ValueError("API_KEY must be set in AWS Secrets Manager or environment variable")
-        
-        logger.info("API key retrieved from environment variable")
-        return cls._api_key
-    
-    @property
-    def API_KEY(self) -> str:
-        """Property to access API key safely."""
-        return self.get_api_key()
-
-
-# ==================== Rate Limiter ====================
-class RateLimiter:
-    """Rate limiting and anomaly detection for API requests with bounded memory."""
-    
-    # Injection attack patterns
-    SQL_KEYWORDS = [
-        'SELECT', 'INSERT', 'UPDATE', 'DELETE', 'DROP', 'CREATE', 'ALTER', 'EXEC', 'EXECUTE',
-        'UNION', 'JOIN', 'WHERE', 'FROM', 'TABLE', '--', ';--', '/*', '*/', 'xp_', 'sp_',
-        'INFORMATION_SCHEMA', 'SYSOBJECTS', 'SYSCOLUMNS'
-    ]
-    
-    SCRIPT_PATTERNS = [
-        re.compile(r'<script[^>]*>.*?</script>', re.IGNORECASE | re.DOTALL),
-        re.compile(r'javascript:', re.IGNORECASE),
-        re.compile(r'on\w+\s*=', re.IGNORECASE),  # Event handlers like onclick=
-        re.compile(r'<iframe[^>]*>', re.IGNORECASE),
-        re.compile(r'<object[^>]*>', re.IGNORECASE),
-        re.compile(r'<embed[^>]*>', re.IGNORECASE),
-    ]
-    
-    COMMAND_INJECTION_PATTERNS = [
-        re.compile(r'[;&|`$]'),  # Shell metacharacters
-        re.compile(r'\$\(.*?\)'),  # Command substitution
-        re.compile(r'`.*?`'),  # Backtick command execution
-        re.compile(r'\|\s*\w+'),  # Pipe to command
-        re.compile(r'&&|\|\|'),  # Command chaining
-    ]
-    
-    def __init__(self):
-        self.request_counts = OrderedDict()
-        self.blocked_ips = OrderedDict()
-        self.max_clients = Config.RATE_LIMITER_MAX_CLIENTS
-        self.last_cleanup = time.time()
-        self.cleanup_interval = 300  # Cleanup every 5 minutes
-        
-    def _cleanup_old_entries(self):
-        """Periodically cleanup old entries to prevent memory exhaustion."""
-        now = time.time()
-        
-        # Only cleanup if interval has passed
-        if now - self.last_cleanup < self.cleanup_interval:
-            return
-        
-        self.last_cleanup = now
-        window_start = now - Config.RATE_LIMIT_WINDOW
-        
-        # Clean old request counts
-        clients_to_remove = []
-        for client_id, timestamps in self.request_counts.items():
-            # Remove old timestamps
-            self.request_counts[client_id] = [
-                ts for ts in timestamps if ts > window_start
-            ]
-            # Mark empty entries for removal
-            if not self.request_counts[client_id]:
-                clients_to_remove.append(client_id)
-        
-        for client_id in clients_to_remove:
-            del self.request_counts[client_id]
-        
-        # Clean expired blocks
-        expired_blocks = [
-            client_id for client_id, block_until in self.blocked_ips.items()
-            if now >= block_until
-        ]
-        for client_id in expired_blocks:
-            del self.blocked_ips[client_id]
-        
-        logger.info(f"Rate limiter cleanup: {len(clients_to_remove)} inactive clients, {len(expired_blocks)} expired blocks removed")
-    
-    def _enforce_size_limit(self):
-        """Enforce maximum number of tracked clients using LRU eviction."""
-        # Remove oldest entries if we exceed the limit
-        while len(self.request_counts) > self.max_clients:
-            # Remove oldest (first) entry
-            self.request_counts.popitem(last=False)
-            logger.warning("Rate limiter at capacity, evicting oldest client")
-        
-        while len(self.blocked_ips) > self.max_clients:
-            self.blocked_ips.popitem(last=False)
-    
-    def check_rate_limit(self, client_id: str) -> bool:
-        """
-        Check if client has exceeded rate limit.
-        
-        Args:
-            client_id: Client identifier (IP address or API key hash)
-            
-        Returns:
-            True if request is allowed, False if rate limited
-        """
-        now = time.time()
-        window_start = now - Config.RATE_LIMIT_WINDOW
-        
-        # Periodic cleanup
-        self._cleanup_old_entries()
-        
-        # Check if client is blocked
-        if client_id in self.blocked_ips:
-            block_until = self.blocked_ips[client_id]
-            if now < block_until:
-                logger.warning(f"Blocked client attempted request")
-                # Move to end (most recently used)
-                self.blocked_ips.move_to_end(client_id)
-                return False
-            else:
-                del self.blocked_ips[client_id]
-        
-        # Initialize or get existing request list
-        if client_id not in self.request_counts:
-            self.request_counts[client_id] = []
-        
-        # Move to end (most recently used)
-        self.request_counts.move_to_end(client_id)
-        
-        # Clean old requests
-        self.request_counts[client_id] = [
-            req_time for req_time in self.request_counts[client_id]
-            if req_time > window_start
-        ]
-        
-        # Check rate limit
-        if len(self.request_counts[client_id]) >= Config.RATE_LIMIT_REQUESTS:
-            logger.warning(f"Rate limit exceeded for client")
-            # Block for 5 minutes
-            self.blocked_ips[client_id] = now + 300
-            self._enforce_size_limit()
-            return False
-        
-        # Add current request
-        self.request_counts[client_id].append(now)
-        
-        # Enforce size limits
-        self._enforce_size_limit()
-        
-        return True
-    
-    def _check_sql_injection(self, text: str) -> bool:
-        """Check for SQL injection patterns."""
-        text_upper = text.upper()
-        
-        # Check for SQL keywords
-        keyword_count = sum(1 for keyword in self.SQL_KEYWORDS if keyword in text_upper)
-        if keyword_count >= 2:  # Multiple SQL keywords suggest injection attempt
-            logger.warning(f"SQL injection pattern detected: {keyword_count} SQL keywords found")
-            return True
-        
-        # Check for SQL comment patterns
-        if '--' in text or '/*' in text or '*/' in text:
-            logger.warning("SQL injection pattern detected: SQL comment syntax")
-            return True
-        
-        return False
-    
-    def _check_xss(self, text: str) -> bool:
-        """Check for XSS (Cross-Site Scripting) patterns."""
-        for pattern in self.SCRIPT_PATTERNS:
-            if pattern.search(text):
-                logger.warning("XSS pattern detected: script or event handler")
-                return True
-        return False
+    DYNAMODB_HIGHLIGHTS_TABLE = os.getenv("DYNAMODB_
