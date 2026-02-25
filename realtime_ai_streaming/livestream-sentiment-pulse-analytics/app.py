@@ -17,7 +17,8 @@ from contextlib import asynccontextmanager
 import hashlib
 
 import boto3
-from botocore.exceptions import ClientError, NoCredentialsError, PartialCredentialsError
+from botocore.config import Config
+from botocore.exceptions import ClientError, NoCredentialsError, PartialCredentialsError, BotoCoreError
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, BackgroundTasks, Security, Depends, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -25,6 +26,170 @@ from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field, validator
 import uvicorn
 import bleach
+
+
+# ==================== AWS Configuration and Validation ====================
+class AWSClientManager:
+    """Manages AWS client configuration with proper credential validation, retries, and error handling."""
+    
+    # Boto3 client configuration with retries and timeouts
+    BOTO3_CONFIG = Config(
+        retries={
+            'max_attempts': 5,
+            'mode': 'adaptive'  # Uses exponential backoff
+        },
+        connect_timeout=5,
+        read_timeout=60,
+        max_pool_connections=50
+    )
+    
+    _clients = {}
+    _credentials_validated = False
+    
+    @classmethod
+    def validate_credentials(cls) -> bool:
+        """
+        Validate AWS credentials on startup.
+        
+        Returns:
+            bool: True if credentials are valid
+            
+        Raises:
+            NoCredentialsError: If no credentials are found
+            PartialCredentialsError: If credentials are incomplete
+            ClientError: If credentials are invalid
+        """
+        if cls._credentials_validated:
+            return True
+        
+        try:
+            # Use STS to validate credentials
+            sts_client = boto3.client('sts', config=cls.BOTO3_CONFIG)
+            response = sts_client.get_caller_identity()
+            
+            logger.info(f"AWS credentials validated successfully. Account: {response.get('Account', 'Unknown')}")
+            cls._credentials_validated = True
+            return True
+            
+        except NoCredentialsError as e:
+            logger.error("AWS credentials not found. Please configure credentials.")
+            raise
+        except PartialCredentialsError as e:
+            logger.error("AWS credentials are incomplete.")
+            raise
+        except ClientError as e:
+            logger.error(f"AWS credentials validation failed: {e}")
+            raise
+        except Exception as e:
+            logger.error(f"Unexpected error during AWS credential validation: {e}")
+            raise
+    
+    @classmethod
+    def get_client(cls, service_name: str, region_name: Optional[str] = None):
+        """
+        Get or create a boto3 client with proper configuration.
+        
+        Args:
+            service_name: AWS service name (e.g., 's3', 'dynamodb')
+            region_name: AWS region name (optional)
+            
+        Returns:
+            Configured boto3 client
+        """
+        # Validate credentials first
+        if not cls._credentials_validated:
+            cls.validate_credentials()
+        
+        # Create cache key
+        cache_key = f"{service_name}:{region_name or 'default'}"
+        
+        # Return cached client if available
+        if cache_key in cls._clients:
+            return cls._clients[cache_key]
+        
+        # Create new client with configuration
+        try:
+            client_kwargs = {'config': cls.BOTO3_CONFIG}
+            if region_name:
+                client_kwargs['region_name'] = region_name
+            
+            client = boto3.client(service_name, **client_kwargs)
+            cls._clients[cache_key] = client
+            
+            logger.info(f"Created AWS {service_name} client for region {region_name or 'default'}")
+            return client
+            
+        except Exception as e:
+            logger.error(f"Failed to create AWS {service_name} client: {e}")
+            raise
+    
+    @classmethod
+    async def execute_with_backoff(cls, func, *args, max_retries: int = 5, **kwargs):
+        """
+        Execute AWS API call with exponential backoff.
+        
+        Args:
+            func: Function to execute
+            *args: Positional arguments for the function
+            max_retries: Maximum number of retry attempts
+            **kwargs: Keyword arguments for the function
+            
+        Returns:
+            Result of the function call
+            
+        Raises:
+            Exception: If all retries are exhausted
+        """
+        base_delay = 1  # Start with 1 second
+        max_delay = 60  # Cap at 60 seconds
+        
+        for attempt in range(max_retries):
+            try:
+                # Execute in thread pool for sync boto3 calls
+                loop = asyncio.get_event_loop()
+                result = await loop.run_in_executor(None, lambda: func(*args, **kwargs))
+                return result
+                
+            except ClientError as e:
+                error_code = e.response.get('Error', {}).get('Code', '')
+                
+                # Don't retry on certain errors
+                non_retryable_errors = [
+                    'AccessDenied',
+                    'InvalidAccessKeyId',
+                    'SignatureDoesNotMatch',
+                    'InvalidClientTokenId'
+                ]
+                
+                if error_code in non_retryable_errors:
+                    logger.error(f"Non-retryable AWS error: {error_code}")
+                    raise
+                
+                # Retry on throttling and server errors
+                if attempt < max_retries - 1:
+                    # Calculate exponential backoff with jitter
+                    delay = min(base_delay * (2 ** attempt), max_delay)
+                    jitter = delay * 0.1 * (0.5 - asyncio.get_event_loop().time() % 1)
+                    total_delay = delay + jitter
+                    
+                    logger.warning(f"AWS API call failed (attempt {attempt + 1}/{max_retries}): {error_code}. Retrying in {total_delay:.2f}s")
+                    await asyncio.sleep(total_delay)
+                else:
+                    logger.error(f"AWS API call failed after {max_retries} attempts: {error_code}")
+                    raise
+                    
+            except BotoCoreError as e:
+                if attempt < max_retries - 1:
+                    delay = min(base_delay * (2 ** attempt), max_delay)
+                    logger.warning(f"BotoCore error (attempt {attempt + 1}/{max_retries}): {e}. Retrying in {delay}s")
+                    await asyncio.sleep(delay)
+                else:
+                    logger.error(f"BotoCore error after {max_retries} attempts: {e}")
+                    raise
+                    
+            except Exception as e:
+                logger.error(f"Unexpected error during AWS API call: {e}")
+                raise
 
 
 # ==================== Input Validation Framework ====================
@@ -265,130 +430,4 @@ class InputValidator:
         Args:
             data: Input to validate
             field_name: Field name for error messages
-            required_keys: List of required keys
-            max_keys: Maximum number of keys allowed
-            
-        Returns:
-            Validated dictionary
-            
-        Raises:
-            ValueError: If validation fails
-        """
-        if not isinstance(data, dict):
-            raise ValueError(f"{field_name} must be a dictionary")
-        
-        if len(data) > max_keys:
-            raise ValueError(f"{field_name} exceeds maximum of {max_keys} keys")
-        
-        if required_keys:
-            missing_keys = set(required_keys) - set(data.keys())
-            if missing_keys:
-                raise ValueError(f"{field_name} missing required keys: {missing_keys}")
-        
-        return data
-    
-    @classmethod
-    def validate_list(cls, data: Any, field_name: str, max_items: int = 1000,
-                     item_validator: callable = None) -> List:
-        """
-        Validate list input.
-        
-        Args:
-            data: Input to validate
-            field_name: Field name for error messages
-            max_items: Maximum number of items allowed
-            item_validator: Optional function to validate each item
-            
-        Returns:
-            Validated list
-            
-        Raises:
-            ValueError: If validation fails
-        """
-        if not isinstance(data, list):
-            raise ValueError(f"{field_name} must be a list")
-        
-        if len(data) > max_items:
-            raise ValueError(f"{field_name} exceeds maximum of {max_items} items")
-        
-        if item_validator:
-            validated_items = []
-            for i, item in enumerate(data):
-                try:
-                    validated_items.append(item_validator(item))
-                except ValueError as e:
-                    raise ValueError(f"{field_name}[{i}]: {str(e)}")
-            return validated_items
-        
-        return data
-
-
-# ==================== Sensitive Data Filter ====================
-class SensitiveDataFilter(logging.Filter):
-    """Filter to redact sensitive data from logs using pattern matching."""
-    
-    # Regex patterns to detect sensitive data formats
-    PATTERNS = {
-        'aws_access_key': re.compile(r'AKIA[0-9A-Z]{16}'),
-        'aws_secret_key': re.compile(r'(?i)aws_secret[_\s]*(?:access[_\s]*)?key[_\s]*[=:]\s*["\']?([A-Za-z0-9/+=]{40})["\']?'),
-        'api_key': re.compile(r'(?i)api[_\s]*key[_\s]*[=:]\s*["\']?([A-Za-z0-9_\-]{20,})["\']?'),
-        'bearer_token': re.compile(r'Bearer\s+[A-Za-z0-9\-._~+/]+=*'),
-        'password': re.compile(r'(?i)password[_\s]*[=:]\s*["\']?([^\s"\']{8,})["\']?'),
-        'secret': re.compile(r'(?i)secret[_\s]*[=:]\s*["\']?([A-Za-z0-9/+=]{16,})["\']?'),
-        'token': re.compile(r'(?i)token[_\s]*[=:]\s*["\']?([A-Za-z0-9_\-\.]{20,})["\']?'),
-        'jwt': re.compile(r'eyJ[A-Za-z0-9_-]*\.eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]*'),
-        'private_key': re.compile(r'-----BEGIN (?:RSA |EC )?PRIVATE KEY-----'),
-        'session_token': re.compile(r'(?i)session[_\s]*token[_\s]*[=:]\s*["\']?([A-Za-z0-9/+=]{20,})["\']?'),
-    }
-    
-    def filter(self, record):
-        """Redact sensitive information from log records using pattern matching."""
-        if hasattr(record, 'msg'):
-            msg = str(record.msg)
-            
-            # Apply each pattern to redact sensitive data
-            for pattern_name, pattern in self.PATTERNS.items():
-                msg = pattern.sub('[REDACTED]', msg)
-            
-            record.msg = msg
-        
-        # Also check args if present
-        if hasattr(record, 'args') and record.args:
-            try:
-                sanitized_args = []
-                for arg in record.args:
-                    arg_str = str(arg)
-                    for pattern_name, pattern in self.PATTERNS.items():
-                        arg_str = pattern.sub('[REDACTED]', arg_str)
-                    sanitized_args.append(arg_str)
-                record.args = tuple(sanitized_args)
-            except Exception:
-                # If sanitization fails, keep original to avoid breaking logging
-                pass
-        
-        return True
-
-
-# Configure logging with sensitive data filter
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
-logger.addFilter(SensitiveDataFilter())
-
-# Create a separate debug logger for internal use
-debug_logger = logging.getLogger(__name__ + '.debug')
-debug_logger.setLevel(logging.DEBUG if os.getenv('DEBUG_MODE', 'false').lower() == 'true' else logging.CRITICAL)
-
-
-# ==================== Configuration ====================
-class Config:
-    """Application configuration from environment variables."""
-    
-    AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
-    KINESIS_VIDEO_STREAM = os.getenv("KINESIS_VIDEO_STREAM", "sentiment-video-stream")
-    KINESIS_DATA_STREAM = os.getenv("KINESIS_DATA_STREAM", "sentiment-data-stream")
-    DYNAMODB_TABLE = os.getenv("DYNAMODB_TABLE", "sentiment-analytics")
-    DYNAMODB_EVENTS_TABLE = os.getenv("DYNAMODB_EVENTS_TABLE", "live-events")
-    DYNAMODB_HIGHLIGHTS_TABLE = os.getenv("DYNAMODB_
+            required_keys: List of required
