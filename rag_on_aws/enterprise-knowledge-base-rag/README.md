@@ -143,7 +143,7 @@ SIMILARITY_THRESHOLD=0.7
 ### Start the API Server
 
 ```bash
-python app.py
+python knowledge_base_rag.py
 # API available at http://localhost:8000
 # Interactive docs at http://localhost:8000/docs
 ```
@@ -308,7 +308,7 @@ aws dynamodb create-table \
 
 ```
 enterprise-knowledge-base-rag/
-├── app.py                        # FastAPI application (ingestion + query + feedback)
+├── knowledge_base_rag.py         # FastAPI application (ingestion + query + feedback)
 ├── requirements.txt              # Python dependencies
 ├── config.yaml                   # Chunking and retrieval configuration
 ├── README.md                     # This file
