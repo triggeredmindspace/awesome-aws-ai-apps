@@ -1,0 +1,47 @@
+# Enterprise Knowledge Base RAG — configuration
+# Override any value with an environment variable of the same name (upper-cased).
+
+aws:
+  region: us-east-1
+
+s3:
+  bucket: enterprise-kb-documents
+  document_prefix: documents/
+
+opensearch:
+  endpoint: ""           # set via OPENSEARCH_ENDPOINT env var
+  index: enterprise-knowledge-base
+  knn_dimension: 1536    # Titan Embeddings v2 output dimension
+
+bedrock:
+  generation_model_id: anthropic.claude-sonnet-4-6
+  embedding_model_id: amazon.titan-embed-text-v2:0
+  max_tokens: 2048
+
+dynamodb:
+  table: kb-query-history
+  query_ttl_days: 90
+
+sns:
+  topic_arn: ""          # set via SNS_TOPIC_ARN env var
+
+chunking:
+  chunk_size: 1000       # characters per chunk
+  chunk_overlap: 200     # overlap between adjacent chunks
+
+retrieval:
+  top_k: 5               # number of chunks to retrieve per query
+  similarity_threshold: 0.7  # minimum relevance score (0–1)
+
+supported_formats:
+  - application/pdf
+  - text/plain
+  - text/markdown
+
+categories:
+  - policy
+  - technical
+  - legal
+  - hr
+  - finance
+  - general
