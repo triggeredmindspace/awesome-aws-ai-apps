@@ -1,0 +1,231 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Multi-Tenant Customer Support RAG — Bedrock + OpenSearch Serverless + SQS
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+  S3BucketName:
+    Type: String
+    Default: customer-support-docs
+  ConfidenceThreshold:
+    Type: String
+    Default: "0.72"
+  SessionTTLHours:
+    Type: Number
+    Default: 24
+  BedrockModelId:
+    Type: String
+    Default: anthropic.claude-sonnet-4-6
+  EmbedModelId:
+    Type: String
+    Default: amazon.titan-embed-text-v2:0
+
+Resources:
+
+  # ── S3: document storage ─────────────────────────────────────────────────
+  DocumentsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${S3BucketName}-${EnvironmentName}-${AWS::AccountId}"
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # ── DynamoDB: sessions ───────────────────────────────────────────────────
+  SessionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "support-sessions-${EnvironmentName}"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: session_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: session_id
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: expires_at
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  # ── DynamoDB: tenants ────────────────────────────────────────────────────
+  TenantsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "support-tenants-${EnvironmentName}"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: tenant_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: tenant_id
+          KeyType: HASH
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  # ── SQS: escalation FIFO queue ───────────────────────────────────────────
+  EscalationQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "support-escalation-${EnvironmentName}.fifo"
+      FifoQueue: true
+      ContentBasedDeduplication: true
+      MessageRetentionPeriod: 86400
+      VisibilityTimeout: 60
+      KmsMasterKeyId: alias/aws/sqs
+
+  # ── OpenSearch Serverless: encryption, network, access ───────────────────
+  OSSEncryptionPolicy:
+    Type: AWS::OpenSearchServerless::SecurityPolicy
+    Properties:
+      Name: !Sub "support-enc-${EnvironmentName}"
+      Type: encryption
+      Policy: !Sub |
+        {
+          "Rules": [{"Resource": ["collection/support-*"], "ResourceType": "collection"}],
+          "AWSOwnedKey": true
+        }
+
+  OSSNetworkPolicy:
+    Type: AWS::OpenSearchServerless::SecurityPolicy
+    Properties:
+      Name: !Sub "support-net-${EnvironmentName}"
+      Type: network
+      Policy: !Sub |
+        [{
+          "Rules": [
+            {"Resource": ["collection/support-*"], "ResourceType": "collection"},
+            {"Resource": ["collection/support-*"], "ResourceType": "dashboard"}
+          ],
+          "AllowFromPublic": false,
+          "SourceVPCEs": []
+        }]
+
+  OSSCollection:
+    Type: AWS::OpenSearchServerless::Collection
+    DependsOn: [OSSEncryptionPolicy, OSSNetworkPolicy]
+    Properties:
+      Name: !Sub "support-${EnvironmentName}"
+      Type: VECTORSEARCH
+      Description: Per-tenant vector indices for customer support RAG
+
+  OSSAccessPolicy:
+    Type: AWS::OpenSearchServerless::AccessPolicy
+    Properties:
+      Name: !Sub "support-access-${EnvironmentName}"
+      Type: data
+      Policy: !Sub |
+        [{
+          "Rules": [
+            {
+              "Resource": ["collection/support-${EnvironmentName}"],
+              "Permission": ["aoss:CreateCollectionItems","aoss:DeleteCollectionItems","aoss:UpdateCollectionItems","aoss:DescribeCollectionItems"],
+              "ResourceType": "collection"
+            },
+            {
+              "Resource": ["index/support-${EnvironmentName}/*"],
+              "Permission": ["aoss:CreateIndex","aoss:DeleteIndex","aoss:UpdateIndex","aoss:DescribeIndex","aoss:ReadDocument","aoss:WriteDocument"],
+              "ResourceType": "index"
+            }
+          ],
+          "Principal": ["${AppRole.Arn}"]
+        }]
+
+  # ── IAM: application role ────────────────────────────────────────────────
+  AppRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "support-rag-app-${EnvironmentName}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+                - ecs-tasks.amazonaws.com
+                - ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SupportRAGPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: S3Access
+                Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:ListBucket]
+                Resource:
+                  - !GetAtt DocumentsBucket.Arn
+                  - !Sub "${DocumentsBucket.Arn}/*"
+              - Sid: DynamoDBAccess
+                Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt SessionsTable.Arn
+                  - !GetAtt TenantsTable.Arn
+              - Sid: SQSAccess
+                Effect: Allow
+                Action: [sqs:SendMessage, sqs:ReceiveMessage, sqs:DeleteMessage, sqs:GetQueueAttributes]
+                Resource: !GetAtt EscalationQueue.Arn
+              - Sid: BedrockAccess
+                Effect: Allow
+                Action: [bedrock:InvokeModel]
+                Resource: "*"
+              - Sid: TextractAccess
+                Effect: Allow
+                Action: [textract:DetectDocumentText, textract:AnalyzeDocument]
+                Resource: "*"
+              - Sid: OpenSearchServerlessAccess
+                Effect: Allow
+                Action: [aoss:APIAccessAll]
+                Resource: !Sub "arn:aws:aoss:${AWS::Region}:${AWS::AccountId}:collection/*"
+
+Outputs:
+  DocumentsBucketName:
+    Value: !Ref DocumentsBucket
+    Export:
+      Name: !Sub "${EnvironmentName}-SupportDocsBucket"
+
+  SessionsTableName:
+    Value: !Ref SessionsTable
+    Export:
+      Name: !Sub "${EnvironmentName}-SupportSessionsTable"
+
+  TenantsTableName:
+    Value: !Ref TenantsTable
+    Export:
+      Name: !Sub "${EnvironmentName}-SupportTenantsTable"
+
+  EscalationQueueUrl:
+    Value: !Ref EscalationQueue
+    Export:
+      Name: !Sub "${EnvironmentName}-EscalationQueueUrl"
+
+  OSSCollectionEndpoint:
+    Value: !GetAtt OSSCollection.CollectionEndpoint
+    Export:
+      Name: !Sub "${EnvironmentName}-OSSEndpoint"
+
+  AppRoleArn:
+    Value: !GetAtt AppRole.Arn
+    Export:
+      Name: !Sub "${EnvironmentName}-SupportRAGRoleArn"
