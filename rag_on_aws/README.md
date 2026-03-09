@@ -1,10 +1,15 @@
-# RAG applications with AWS services (Bedrock, OpenSearch, S3)
+# 📚 RAG on AWS
 
-This directory contains rag applications with aws services (bedrock, opensearch, s3).
+Retrieval-Augmented Generation applications built with AWS services — Amazon Bedrock, OpenSearch Serverless, S3, Textract, and more.
 
 ## Applications
 
-*Applications will be added here by the automated agent.*
+### [Enterprise Knowledge Base RAG](./enterprise-knowledge-base-rag/)
+Transform enterprise document repositories into a queryable knowledge base. Employees ask plain-English questions and receive accurate, cited answers powered by Amazon Bedrock (Claude), Amazon OpenSearch Serverless, and S3.
+
+**Key AWS services:** Bedrock (Claude + Titan Embeddings), OpenSearch Serverless, S3, DynamoDB, Textract, Comprehend, SNS
+
+**Use cases:** HR policy Q&A, legal document search, technical runbook retrieval, customer support knowledge base
 
 ---
 
