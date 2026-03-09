@@ -11,6 +11,13 @@ Transform enterprise document repositories into a queryable knowledge base. Empl
 
 **Use cases:** HR policy Q&A, legal document search, technical runbook retrieval, customer support knowledge base
 
+### [Multi-Tenant Customer Support RAG](./customer-support-rag/)
+Turn product documentation, FAQs, and resolved tickets into a conversational support assistant — with strict per-tenant vector isolation, multi-turn memory, and automatic escalation to human agents when confidence drops.
+
+**Key AWS services:** Bedrock (Claude + Titan Embeddings), OpenSearch Serverless, S3, DynamoDB, Textract, SQS FIFO
+
+**Use cases:** SaaS product support, e-commerce help desks, telecom device support, financial product FAQs
+
 ---
 
 *This category is automatically updated daily.*

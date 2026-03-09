@@ -1,0 +1,45 @@
+app:
+  name: "Multi-Tenant Customer Support RAG"
+  version: "1.0.0"
+  port: 8000
+
+aws:
+  region: us-east-1
+
+bedrock:
+  model_id: anthropic.claude-sonnet-4-6
+  embed_model_id: amazon.titan-embed-text-v2:0
+
+retrieval:
+  top_k: 5
+  confidence_threshold: 0.72   # below this → increment miss counter
+  chunk_size: 800
+  chunk_overlap: 150
+
+sessions:
+  ttl_hours: 24
+  max_conversation_turns: 20   # older turns are dropped from context window
+  miss_threshold: 3            # auto-escalate after N low-confidence replies
+
+escalation:
+  enabled: true
+  # SQS FIFO queue — messages are grouped per tenant_id
+  queue_type: sqs_fifo
+
+document_types:
+  - faq
+  - manual
+  - release_notes
+  - policy
+  - resolved_ticket
+
+tenant_plans:
+  starter:
+    max_documents: 500
+    max_sessions_per_day: 1000
+  pro:
+    max_documents: 5000
+    max_sessions_per_day: 20000
+  enterprise:
+    max_documents: unlimited
+    max_sessions_per_day: unlimited
