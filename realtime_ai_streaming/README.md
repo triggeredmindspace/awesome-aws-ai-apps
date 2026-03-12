@@ -1,10 +1,15 @@
-# Real-time AI with Kinesis and Lambda
+# Real-time AI Streaming
 
-This directory contains real-time ai with kinesis and lambda.
+Low-latency AI pipelines built on **Amazon Kinesis**, **AWS Lambda**, and **Amazon Bedrock** — process streams of events, video frames, or social data with millisecond response times.
 
 ## Applications
 
-*Applications will be added here by the automated agent.*
+### [LiveStream Sentiment Pulse Analytics](./livestream-sentiment-pulse-analytics/)
+Simultaneously analyse live video streams and social media feeds to detect audience sentiment, emotional reactions, and engagement patterns during live events or product launches.
+
+**Key AWS services:** Kinesis Data Streams, Lambda, Bedrock, OpenSearch Serverless, Rekognition, Comprehend
+
+**Use cases:** Live broadcast monitoring, sports event analytics, product launch war rooms, content creator dashboards
 
 ---
 
