@@ -1,74 +1,106 @@
-# 🚀 Awesome AWS AI Apps
+# Awesome AWS AI Apps
 
-A curated collection of AI and Machine Learning applications built with AWS services. This repository showcases practical, production-ready examples of AI agents, RAG systems, serverless ML apps, and more—all powered by AWS.
+A curated collection of production-ready AI applications built on AWS. Each app ships with full source code, a CloudFormation template, a deploy script, and runnable examples.
 
-## 🌟 Overview
+## Categories
 
-This repository contains unique, open-source AI applications that leverage AWS services like:
-- 🧠 Amazon Bedrock (Foundation Models)
-- 🤖 Amazon SageMaker (ML Training & Deployment)
-- ⚡ AWS Lambda (Serverless Compute)
-- 🔍 Amazon OpenSearch (Vector Search)
-- 📦 Amazon S3 (Storage)
-- 🔄 Amazon Kinesis (Real-time Streaming)
-- And many more!
-
-## 📂 Categories
-
-### 🤖 Bedrock AI Agents
-AI agents powered by Amazon Bedrock foundation models.
-
-### ⚡ Serverless AI Apps
-Serverless applications using AWS Lambda, API Gateway, and managed AI services.
-
-### 📚 RAG on AWS
-Retrieval-Augmented Generation applications with AWS vector databases and LLMs.
-
-### 🧪 SageMaker ML Apps
-Machine learning applications using Amazon SageMaker for training and deployment.
-
-### 🌊 Real-time AI Streaming
-Real-time AI applications using Amazon Kinesis and streaming analytics.
-
-### 🎨 Multimodal AI
-Applications that work with text, images, video, and audio using AWS AI services.
-
-### ✍️ AI Content Generation
-Content generation systems for text, images, and media.
-
-### 💬 Conversational AI
-Chatbots, voice assistants, and conversational AI on AWS.
-
-## 🚀 Quick Start
-
-Each application includes:
-- Complete source code
-- Detailed README with setup instructions
-- AWS CloudFormation templates for infrastructure
-- Requirements and dependencies
-- Usage examples
-
-Navigate to any category folder and choose an app to get started!
-
-## 💡 Prerequisites
-
-- AWS Account with appropriate permissions
-- Python 3.10 or higher
-- AWS CLI configured
-- Basic knowledge of AWS services
-
-## 📝 License
-
-MIT License - see individual app directories for details.
-
-## 🤝 Contributing
-
-This repository is maintained by an automated agent that generates new applications daily. Each app is reviewed for quality and security before being added.
-
-## ⚠️ Cost Warning
-
-These applications use AWS services that may incur costs. Always review the pricing information for each AWS service before deploying. Most apps include cost estimates in their README files.
+| Category | Apps | Key Services |
+|---|---|---|
+| [RAG on AWS](#-rag-on-aws) | 2 | Bedrock, OpenSearch Serverless, S3, DynamoDB |
+| [Conversational AI](#-conversational-ai) | 1 | Bedrock, Transcribe, DynamoDB |
+| [Serverless AI Apps](#-serverless-ai-apps) | 1 | Lambda, API Gateway, Textract, Bedrock |
+| [Real-time AI Streaming](#-real-time-ai-streaming) | 1 | Kinesis, Lambda, Bedrock, OpenSearch |
+| [SageMaker ML Apps](#-sagemaker-ml-apps) | 1 | SageMaker, Forecast, DynamoDB |
+| [Bedrock AI Agents](#-bedrock-ai-agents) | coming soon | Bedrock Agents, Lambda, Knowledge Bases |
 
 ---
 
-*This repository is automatically updated daily with new AI applications. Star ⭐ this repo to stay updated!*
+## 📚 RAG on AWS
+
+Retrieval-Augmented Generation — give LLMs access to your own documents.
+
+### [Enterprise Knowledge Base RAG](./rag_on_aws/enterprise-knowledge-base-rag/)
+Query internal documents in plain English. Employees get accurate, cited answers from HR policies, legal docs, runbooks, and support wikis.
+
+**Services:** Bedrock (Claude + Titan Embeddings), OpenSearch Serverless, S3, DynamoDB, Textract, Comprehend, SNS
+
+### [Multi-Tenant Customer Support RAG](./rag_on_aws/customer-support-rag/)
+Per-tenant isolated vector indices, multi-turn conversation memory, and automatic escalation to human agents after repeated low-confidence responses.
+
+**Services:** Bedrock (Claude + Titan Embeddings), OpenSearch Serverless, S3, DynamoDB, Textract, SQS FIFO
+
+---
+
+## 💬 Conversational AI
+
+### [Meeting Context Navigator](./conversational_ai/meeting-context-navigator/)
+Index meeting transcripts and query them conversationally — retrieve decisions, action items, and key discussions without scrubbing through recordings.
+
+**Services:** Bedrock, Transcribe, S3, DynamoDB, OpenSearch
+
+---
+
+## ⚡ Serverless AI Apps
+
+### [Smart Invoice Intelligence Platform](./serverless_ai_apps/smart-invoice-intelligence-platform/)
+Automated invoice processing — extract, validate, categorise, and route invoices with zero manual data entry. Detects anomalies and integrates with accounting systems.
+
+**Services:** Lambda, API Gateway, Textract, Bedrock, DynamoDB, S3, SQS
+
+---
+
+## 🌊 Real-time AI Streaming
+
+### [LiveStream Sentiment Pulse Analytics](./realtime_ai_streaming/livestream-sentiment-pulse-analytics/)
+Analyse live video and social media feeds simultaneously to surface audience sentiment and engagement patterns in real time during broadcasts or product launches.
+
+**Services:** Kinesis Data Streams, Lambda, Bedrock, OpenSearch, Rekognition, Comprehend
+
+---
+
+## 🧪 SageMaker ML Apps
+
+### [Smart Inventory Demand Forecaster](./sagemaker_ml_apps/smart-inventory-demand-forecaster/)
+Time-series demand forecasting across multiple warehouses. Analyses historical sales, seasonal trends, and external signals to optimise stock and prevent stockouts.
+
+**Services:** SageMaker, Amazon Forecast, DynamoDB, S3, Lambda, QuickSight
+
+---
+
+## 🤖 Bedrock AI Agents
+
+Coming soon — autonomous agents built with Amazon Bedrock Agents, Lambda action groups, and Knowledge Bases.
+
+---
+
+## Getting Started
+
+Every app follows the same pattern:
+
+```bash
+cd <category>/<app-name>/aws
+./deploy.sh            # provisions all AWS resources via CloudFormation
+cd ..
+pip install -r requirements.txt
+python <app>.py        # starts the service
+```
+
+Detailed setup steps, environment variables, and API examples are in each app's own README.
+
+## Prerequisites
+
+- AWS account with permissions for the services listed per app
+- Python 3.10+
+- AWS CLI configured (`aws configure`)
+
+## Cost
+
+These apps use AWS services that incur costs. Review pricing for each service before deploying. Most apps are designed to stay within AWS Free Tier limits for light testing, but production workloads — especially OpenSearch Serverless and Bedrock inference — will accrue charges.
+
+## License
+
+MIT — see individual app directories for details.
+
+---
+
+*New applications are added regularly. Watch or star this repo to stay updated.*

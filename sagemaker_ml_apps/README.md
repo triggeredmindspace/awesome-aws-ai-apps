@@ -1,10 +1,15 @@
-# ML applications using Amazon SageMaker
+# SageMaker ML Apps
 
-This directory contains ml applications using amazon sagemaker.
+End-to-end machine learning applications built on **Amazon SageMaker** — from data prep and model training to deployment, monitoring, and automated retraining.
 
 ## Applications
 
-*Applications will be added here by the automated agent.*
+### [Smart Inventory Demand Forecaster](./smart-inventory-demand-forecaster/)
+Time-series demand forecasting across multiple warehouses. Analyses historical sales data, seasonal patterns, and external signals to optimise stock levels, reduce waste, and prevent costly stockouts.
+
+**Key AWS services:** SageMaker, Amazon Forecast, DynamoDB, S3, Lambda, QuickSight
+
+**Use cases:** Retail replenishment planning, warehouse stock optimisation, supply chain risk reduction, seasonal campaign prep
 
 ---
 
