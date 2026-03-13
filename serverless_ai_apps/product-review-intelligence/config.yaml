@@ -1,0 +1,44 @@
+app:
+  name: product-review-intelligence
+  version: "1.0.0"
+  description: >
+    Serverless AI platform that ingests customer product reviews, analyses
+    them with Amazon Bedrock (Claude), and surfaces actionable insights
+    via a REST API and scheduled email digests.
+
+bedrock:
+  model_id: amazon.nova-pro-v1:0
+  max_tokens: 1024
+  temperature: 0.2
+
+dynamodb:
+  reviews_table: product-reviews
+  insights_table: product-insights
+  # GSI used for product-scoped queries
+  product_gsi: product_id-index
+
+s3:
+  reviews_bucket: product-review-intelligence-ingestion
+
+sqs:
+  # FIFO queue keeps per-product ordering and enables at-least-once processing
+  queue_name: product-review-processing.fifo
+  visibility_timeout_seconds: 300
+  max_receive_count: 3  # retries before DLQ
+
+ses:
+  # Must be a verified SES identity; leave empty to disable email digests
+  digest_email: ""
+
+lambda:
+  runtime: python3.12
+  memory_mb: 512
+  timeout_seconds: 60
+  tracing: Active        # X-Ray active tracing
+
+eventbridge:
+  # Weekly digest schedule (every Monday at 08:00 UTC)
+  digest_schedule: "cron(0 8 ? * MON *)"
+
+logging:
+  level: INFO

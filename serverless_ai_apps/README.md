@@ -13,4 +13,13 @@ Automated invoice processing that extracts, validates, and categorises invoice d
 
 ---
 
+### [AI-Powered Product Review Intelligence Platform](./product-review-intelligence/)
+Serverless platform that ingests customer product reviews via REST API or S3 batch files, analyses them with Amazon Bedrock (Claude) to extract sentiment, themes, and issues, then generates executive summaries and delivers weekly email digests.
+
+**Key AWS services:** Lambda, API Gateway, Bedrock, SQS (FIFO), DynamoDB, S3, EventBridge, SES
+
+**Use cases:** Product feedback aggregation, VP-level insight reports, issue prioritisation, automated weekly review digests
+
+---
+
 *This category is automatically updated daily.*

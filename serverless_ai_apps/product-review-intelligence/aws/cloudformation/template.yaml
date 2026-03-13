@@ -1,0 +1,457 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  AI-Powered Product Review Intelligence Platform —
+  serverless review ingestion, Claude-powered analysis,
+  insight aggregation, and scheduled email digests.
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+  BedrockModelId:
+    Type: String
+    Default: amazon.nova-pro-v1:0
+    Description: Amazon Bedrock model ID for review analysis
+  DigestEmail:
+    Type: String
+    Default: ""
+    Description: >
+      Verified SES email address for weekly digest reports.
+      Leave empty to disable email delivery.
+  LogLevel:
+    Type: String
+    Default: INFO
+    AllowedValues: [DEBUG, INFO, WARNING, ERROR]
+
+Conditions:
+  IsProd: !Equals [!Ref Environment, prod]
+  HasDigestEmail: !Not [!Equals [!Ref DigestEmail, ""]]
+
+Globals:
+  Function:
+    Runtime: python3.12
+    MemorySize: 512
+    Timeout: 60
+    Environment:
+      Variables:
+        ENVIRONMENT: !Ref Environment
+        AWS_REGION: !Ref AWS::Region
+        BEDROCK_MODEL_ID: !Ref BedrockModelId
+        REVIEWS_TABLE: !Ref ReviewsTable
+        INSIGHTS_TABLE: !Ref InsightsTable
+        REVIEWS_BUCKET: !Ref ReviewsBucket
+        REVIEW_QUEUE_URL: !Ref ReviewQueue
+        DIGEST_EMAIL: !Ref DigestEmail
+        LOG_LEVEL: !Ref LogLevel
+    Tracing: Active
+
+Resources:
+
+  # ── S3 ──────────────────────────────────────────────────────────────────────
+  ReviewsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub product-review-intelligence-${Environment}-${AWS::AccountId}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: ArchiveOldFiles
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+            ExpirationInDays: 365
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # ── SQS ─────────────────────────────────────────────────────────────────────
+  ReviewQueueDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub product-review-dlq-${Environment}.fifo
+      FifoQueue: true
+      MessageRetentionPeriod: 1209600  # 14 days
+
+  ReviewQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub product-review-processing-${Environment}.fifo
+      FifoQueue: true
+      ContentBasedDeduplication: false
+      VisibilityTimeout: 300
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt ReviewQueueDLQ.Arn
+        maxReceiveCount: 3
+
+  # ── DynamoDB ─────────────────────────────────────────────────────────────────
+  ReviewsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub product-reviews-${Environment}
+      BillingMode: PAY_PER_REQUEST
+      TableClass: !If [IsProd, STANDARD, STANDARD_INFREQUENT_ACCESS]
+      AttributeDefinitions:
+        - AttributeName: review_id
+          AttributeType: S
+        - AttributeName: product_id
+          AttributeType: S
+        - AttributeName: created_at
+          AttributeType: S
+      KeySchema:
+        - AttributeName: review_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: product_id-index
+          KeySchema:
+            - AttributeName: product_id
+              KeyType: HASH
+            - AttributeName: created_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [IsProd, true, false]
+
+  InsightsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub product-insights-${Environment}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: insight_id
+          AttributeType: S
+        - AttributeName: product_id
+          AttributeType: S
+        - AttributeName: created_at
+          AttributeType: S
+      KeySchema:
+        - AttributeName: insight_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: product_id-index
+          KeySchema:
+            - AttributeName: product_id
+              KeyType: HASH
+            - AttributeName: created_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  # ── IAM Role ─────────────────────────────────────────────────────────────────
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub product-review-intelligence-${Environment}-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+      Policies:
+        - PolicyName: ReviewIntelligencePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: BedrockAccess
+                Effect: Allow
+                Action: bedrock:InvokeModel
+                Resource: !Sub arn:aws:bedrock:${AWS::Region}::foundation-model/*
+              - Sid: DynamoDBAccess
+                Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt ReviewsTable.Arn
+                  - !GetAtt InsightsTable.Arn
+                  - !Sub ${ReviewsTable.Arn}/index/*
+                  - !Sub ${InsightsTable.Arn}/index/*
+              - Sid: SQSAccess
+                Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource:
+                  - !GetAtt ReviewQueue.Arn
+                  - !GetAtt ReviewQueueDLQ.Arn
+              - Sid: S3Access
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt ReviewsBucket.Arn
+                  - !Sub ${ReviewsBucket.Arn}/*
+              - Sid: SESAccess
+                Effect: Allow
+                Action: ses:SendEmail
+                Resource: "*"
+
+  # ── Lambda Functions ──────────────────────────────────────────────────────────
+  IngestReviewFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub product-review-ingest-${Environment}
+      Handler: app.ingest_review_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        S3Bucket: !Ref DeploymentBucketParam
+        S3Key: !Sub product-review-intelligence/lambda.zip
+
+  ProcessReviewFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub product-review-process-${Environment}
+      Handler: app.process_review_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      Code:
+        S3Bucket: !Ref DeploymentBucketParam
+        S3Key: !Sub product-review-intelligence/lambda.zip
+
+  ProcessReviewEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt ReviewQueue.Arn
+      FunctionName: !GetAtt ProcessReviewFunction.Arn
+      BatchSize: 10
+      FunctionResponseTypes:
+        - ReportBatchItemFailures
+
+  GetInsightsFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub product-review-get-insights-${Environment}
+      Handler: app.get_insights_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        S3Bucket: !Ref DeploymentBucketParam
+        S3Key: !Sub product-review-intelligence/lambda.zip
+
+  GenerateInsightsFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub product-review-generate-insights-${Environment}
+      Handler: app.generate_insights_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 120
+      Code:
+        S3Bucket: !Ref DeploymentBucketParam
+        S3Key: !Sub product-review-intelligence/lambda.zip
+
+  WeeklyDigestFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub product-review-weekly-digest-${Environment}
+      Handler: app.weekly_digest_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      Code:
+        S3Bucket: !Ref DeploymentBucketParam
+        S3Key: !Sub product-review-intelligence/lambda.zip
+
+  S3BatchIngestFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub product-review-s3-ingest-${Environment}
+      Handler: app.s3_batch_ingest_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        S3Bucket: !Ref DeploymentBucketParam
+        S3Key: !Sub product-review-intelligence/lambda.zip
+
+  S3BatchIngestPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt S3BatchIngestFunction.Arn
+      Principal: s3.amazonaws.com
+      SourceArn: !GetAtt ReviewsBucket.Arn
+
+  # ── EventBridge Scheduler ─────────────────────────────────────────────────────
+  WeeklyDigestRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub product-review-weekly-digest-${Environment}
+      Description: Triggers weekly review digest generation every Monday at 08:00 UTC
+      ScheduleExpression: "cron(0 8 ? * MON *)"
+      State: ENABLED
+      Targets:
+        - Id: WeeklyDigestLambda
+          Arn: !GetAtt WeeklyDigestFunction.Arn
+
+  WeeklyDigestPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt WeeklyDigestFunction.Arn
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt WeeklyDigestRule.Arn
+
+  # ── API Gateway ───────────────────────────────────────────────────────────────
+  ReviewApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub product-review-intelligence-${Environment}
+      Description: REST API for the Product Review Intelligence Platform
+      EndpointConfiguration:
+        Types: [REGIONAL]
+
+  # /reviews
+  ReviewsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ReviewApi
+      ParentId: !GetAtt ReviewApi.RootResourceId
+      PathPart: reviews
+
+  ReviewsPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ReviewApi
+      ResourceId: !Ref ReviewsResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${IngestReviewFunction.Arn}/invocations
+
+  IngestReviewApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt IngestReviewFunction.Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ReviewApi}/*/*/reviews
+
+  # /insights/{product_id}
+  InsightsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ReviewApi
+      ParentId: !GetAtt ReviewApi.RootResourceId
+      PathPart: insights
+
+  InsightsProductResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ReviewApi
+      ParentId: !Ref InsightsResource
+      PathPart: "{product_id}"
+
+  InsightsGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ReviewApi
+      ResourceId: !Ref InsightsProductResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${GetInsightsFunction.Arn}/invocations
+
+  GetInsightsApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt GetInsightsFunction.Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ReviewApi}/*/*/insights/*
+
+  # /insights/{product_id}/generate
+  GenerateResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ReviewApi
+      ParentId: !Ref InsightsProductResource
+      PathPart: generate
+
+  GeneratePostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ReviewApi
+      ResourceId: !Ref GenerateResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${GenerateInsightsFunction.Arn}/invocations
+
+  GenerateInsightsApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt GenerateInsightsFunction.Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ReviewApi}/*/*/insights/*/generate
+
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - ReviewsPostMethod
+      - InsightsGetMethod
+      - GeneratePostMethod
+    Properties:
+      RestApiId: !Ref ReviewApi
+
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref ReviewApi
+      DeploymentId: !Ref ApiDeployment
+      StageName: !Ref Environment
+
+Parameters:
+  DeploymentBucketParam:
+    Type: String
+    Description: S3 bucket containing the Lambda deployment package
+
+Outputs:
+  ApiEndpoint:
+    Description: API Gateway base URL
+    Value: !Sub https://${ReviewApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}
+    Export:
+      Name: !Sub ${AWS::StackName}-ApiEndpoint
+
+  ReviewsTableName:
+    Value: !Ref ReviewsTable
+    Export:
+      Name: !Sub ${AWS::StackName}-ReviewsTable
+
+  InsightsTableName:
+    Value: !Ref InsightsTable
+    Export:
+      Name: !Sub ${AWS::StackName}-InsightsTable
+
+  ReviewsBucketName:
+    Value: !Ref ReviewsBucket
+    Export:
+      Name: !Sub ${AWS::StackName}-ReviewsBucket
+
+  ReviewQueueUrl:
+    Value: !Ref ReviewQueue
+    Export:
+      Name: !Sub ${AWS::StackName}-ReviewQueueUrl
